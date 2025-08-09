@@ -1,0 +1,63 @@
+services:
+  - type: web
+    name: cobol-support-agent
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: PORT
+        value: 10000
+
+      # IMAP/SMTP (HostGator)
+      - key: IMAP_HOST
+        value: mail.aprendacobol.com.br
+      - key: IMAP_PORT
+        value: "993"
+      - key: MAIL_USER
+        sync: false
+      - key: MAIL_PASS
+        sync: false
+
+      - key: SMTP_HOST
+        value: mail.aprendacobol.com.br
+      - key: SMTP_PORT
+        value: "587"          # use 465 se preferir SSL puro
+      - key: SMTP_TLS_MODE
+        value: starttls       # starttls | ssl
+      - key: SMTP_DEBUG
+        value: "0"
+
+      # LLM (opcional; no Render free, não há Ollama)
+      - key: LLM_BACKEND
+        value: ollama
+      - key: OLLAMA_HOST
+        value: http://127.0.0.1:11434
+      - key: OLLAMA_MODEL
+        value: llama3.1:8b
+
+      # Pastas & comportamento
+      - key: FOLDER_PROCESSED
+        value: Respondidos
+      - key: FOLDER_ESCALATE
+        value: Escalar
+      - key: SENT_FOLDER
+        value: INBOX.Sent
+      - key: CHECK_INTERVAL_SECONDS
+        value: "60"
+      - key: CONFIDENCE_THRESHOLD
+        value: "0.65"
+      - key: EXPUNGE_AFTER_COPY
+        value: "true"
+      - key: LOG_LEVEL
+        value: info
+
+      # Assinatura
+      - key: SIGNATURE_NAME
+        value: Equipe Aprenda COBOL — Suporte
+      - key: SIGNATURE_FOOTER
+        value: Se precisar, responda este e-mail com mais detalhes ou anexe seu arquivo .COB/.CBL.\nHorário de atendimento: 9h–18h (ET), seg–sex.
+      - key: SIGNATURE_LINKS
+        value: https://aprendacobol.com.br/assinatura/
