@@ -1,4 +1,4 @@
-# app.py - Versão 6
+# app.py - Versão 6 (com diagnósticos IMAP, SSL/STARTTLS e rotas extras)
 import os
 import ssl
 import time
@@ -37,6 +37,7 @@ load_dotenv()
 # -------- IMAP (leitura) --------
 IMAP_HOST = os.getenv("IMAP_HOST", "mail.aprendacobol.com.br")
 IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
+IMAP_TLS_MODE = os.getenv("IMAP_TLS_MODE", "ssl").lower()  # ssl | starttls
 MAIL_USER = os.getenv("MAIL_USER")   # suporte@aprendacobol.com.br
 MAIL_PASS = os.getenv("MAIL_PASS")   # senha
 
@@ -70,13 +71,10 @@ SIGNATURE_LINKS = os.getenv("SIGNATURE_LINKS", "")
 DB_PATH = "state.db"
 
 # ========= Utils =========
-
-
 def log(level, *args):
     levels = {"debug": 0, "info": 1, "warn": 2, "error": 3}
     if levels.get(level, 1) >= levels.get(LOG_LEVEL, 1):
         print(f"[{level.upper()}]", *args)
-
 
 def require_env():
     missing = []
@@ -84,18 +82,14 @@ def require_env():
         if not globals().get(k):
             missing.append(k)
     if missing:
-        raise RuntimeError(
-            "Faltam variáveis no ambiente: " + ", ".join(missing))
-
+        raise RuntimeError("Faltam variáveis no ambiente: " + ", ".join(missing))
 
 def db_init():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute(
-        "CREATE TABLE IF NOT EXISTS processed (message_id TEXT PRIMARY KEY)")
+    cur.execute("CREATE TABLE IF NOT EXISTS processed (message_id TEXT PRIMARY KEY)")
     con.commit()
     con.close()
-
 
 def already_processed(msgid: str) -> bool:
     con = sqlite3.connect(DB_PATH)
@@ -105,37 +99,46 @@ def already_processed(msgid: str) -> bool:
     con.close()
     return row is not None
 
-
 def mark_processed(msgid: str):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO processed(message_id) VALUES (?)", (msgid,))
+    cur.execute("INSERT OR IGNORE INTO processed(message_id) VALUES (?)", (msgid,))
     con.commit()
     con.close()
 
 # ========= IMAP =========
-
-
 def connect_imap():
+    """
+    Conecta e faz login no IMAP suportando SSL:993 e STARTTLS:143,
+    com log detalhado quando LOG_LEVEL=debug.
+    """
     ctx = ssl.create_default_context()
-    imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ctx)
-    imap.login(MAIL_USER, MAIL_PASS)
-    return imap
-
+    if IMAP_TLS_MODE == "ssl":
+        imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ctx)
+        if LOG_LEVEL == "debug":
+            imap.debug = 4
+        imap.login(MAIL_USER, MAIL_PASS)
+        return imap
+    elif IMAP_TLS_MODE == "starttls":
+        imap = imaplib.IMAP4(IMAP_HOST, IMAP_PORT)
+        if LOG_LEVEL == "debug":
+            imap.debug = 4
+        imap.starttls(ssl_context=ctx)
+        imap.login(MAIL_USER, MAIL_PASS)
+        return imap
+    else:
+        raise RuntimeError(f"IMAP_TLS_MODE inválido: {IMAP_TLS_MODE}")
 
 def select_inbox(imap):
     typ, _ = imap.select("INBOX")
     if typ != "OK":
         raise RuntimeError("Não foi possível selecionar INBOX")
 
-
 def fetch_unseen(imap):
     typ, data = imap.search(None, 'UNSEEN')
     if typ != "OK":
         return []
     return data[0].split()
-
 
 def parse_message(raw_bytes):
     msg = BytesParser(policy=policy.default).parsebytes(raw_bytes)
@@ -153,8 +156,7 @@ def parse_message(raw_bytes):
             filename = m.get_filename()
             payload = m.get_payload(decode=True) or b""
             try:
-                text = payload.decode(
-                    m.get_content_charset() or "utf-8", errors="ignore")
+                text = payload.decode(m.get_content_charset() or "utf-8", errors="ignore")
             except:
                 text = ""
             if filename and filename.lower().endswith((".cob", ".cbl", ".txt")):
@@ -173,7 +175,6 @@ def parse_message(raw_bytes):
         code_block = "```cobol\n" + plain_text + "\n```"
     return msg, msgid, from_addr, subject, plain_text, code_block
 
-
 def guess_first_name(from_addr: str) -> str:
     local = from_addr.split("@")[0]
     local = re.sub(r"[._\-]+", " ", local).strip()
@@ -184,15 +185,12 @@ def guess_first_name(from_addr: str) -> str:
     return name
 
 # ========= LIST/parse helpers =========
-
-
 def _parse_list_line(line: str):
     """
     Parseia uma linha de LIST IMAP no formato: (<flags>) "<delim>" <name>
     Retorna (flags, delim, name) ou (None, None, None) se falhar.
     """
-    m = re.search(
-        r'\((?P<flags>.*?)\)\s+"(?P<delim>[^"]+)"\s+(?P<name>.*)$', line.strip())
+    m = re.search(r'\((?P<flags>.*?)\)\s+"(?P<delim>[^"]+)"\s+(?P<name>.*)$', line.strip())
     if not m:
         return None, None, None
     flags = m.group("flags").strip()
@@ -202,9 +200,7 @@ def _parse_list_line(line: str):
         name = name[1:-1]
     return flags, delim, name
 
-
 _listed_boxes_printed = False
-
 
 def _list_mailboxes_once(imap):
     global _listed_boxes_printed
@@ -229,8 +225,6 @@ def _list_mailboxes_once(imap):
     return boxes
 
 # ========= Mover robusto =========
-
-
 def move_message(imap, num, dest_folder):
     """
     Move a mensagem para dest_folder:
@@ -285,10 +279,8 @@ def move_message(imap, num, dest_folder):
                 typ, resp = imap.uid('COPY', uid, mb)
                 log("debug", f"IMAP UID COPY -> typ={typ} resp={resp}")
                 if typ == "OK":
-                    typ2, resp2 = imap.uid(
-                        'STORE', uid, '+FLAGS', '(\\Deleted)')
-                    log("debug",
-                        f"IMAP UID STORE Deleted -> typ={typ2} resp={resp2}")
+                    typ2, resp2 = imap.uid('STORE', uid, '+FLAGS', '(\\Deleted)')
+                    log("debug", f"IMAP UID STORE Deleted -> typ={typ2} resp={resp2}")
                     if typ2 == "OK":
                         return True
                     last_err = (typ2, resp2)
@@ -301,8 +293,6 @@ def move_message(imap, num, dest_folder):
     return False
 
 # ========= SMTP envio =========
-
-
 def smtp_send(message: EmailMessage):
     if SMTP_TLS_MODE == "ssl":
         context = ssl.create_default_context()
@@ -322,8 +312,6 @@ def smtp_send(message: EmailMessage):
             smtp.send_message(message)
 
 # ========= Append em Enviados =========
-
-
 def append_to_sent(imap_host, imap_port, user, pwd, sent_folder_name, msg):
     try:
         ctx = ssl.create_default_context()
@@ -352,16 +340,13 @@ def append_to_sent(imap_host, imap_port, user, pwd, sent_folder_name, msg):
             im.create(dest)
         except Exception:
             pass
-        im.append(dest, "", imaplib.Time2Internaldate(
-            time.time()), msg.as_bytes())
+        im.append(dest, "", imaplib.Time2Internaldate(time.time()), msg.as_bytes())
         im.logout()
         log("debug", f"Cópia enviada para pasta de enviados: {dest}")
     except Exception as e:
         log("warn", "Falha ao APPEND em Enviados:", e)
 
 # ========= Assunto/assinatura =========
-
-
 def make_reply_subject(original_subject: str) -> str:
     s = (original_subject or "").strip()
     if s[:3].lower() == "re:":
@@ -369,7 +354,6 @@ def make_reply_subject(original_subject: str) -> str:
     if s.lower().startswith("re :"):
         return "Re:" + s[4:]
     return f"Re: {s}" if s else "Re:"
-
 
 def wrap_with_signature(first_name: str, body_markdown: str) -> str:
     saud = f"Olá{', ' + first_name if first_name else ''}!\n\n"
@@ -379,7 +363,6 @@ def wrap_with_signature(first_name: str, body_markdown: str) -> str:
     if SIGNATURE_LINKS:
         sig_lines.append(SIGNATURE_LINKS)
     return saud + body_markdown.strip() + "\n" + "\n".join(sig_lines) + "\n"
-
 
 def send_reply(original_msg, to_addr, reply_subject, body_markdown):
     body_html = markdown(body_markdown)
@@ -395,19 +378,15 @@ def send_reply(original_msg, to_addr, reply_subject, body_markdown):
     reply.set_content(body_markdown)
     reply.add_alternative(body_html, subtype="html")
 
-    log("info",
-        f"Enviando resposta (SMTP {SMTP_TLS_MODE.upper()}) para {to_addr}…")
+    log("info", f"Enviando resposta (SMTP {SMTP_TLS_MODE.upper()}) para {to_addr}…")
     smtp_send(reply)
     log("info", "Resposta enviada com sucesso.")
     try:
-        append_to_sent(IMAP_HOST, IMAP_PORT, MAIL_USER,
-                       MAIL_PASS, SENT_FOLDER, reply)
+        append_to_sent(IMAP_HOST, IMAP_PORT, MAIL_USER, MAIL_PASS, SENT_FOLDER, reply)
     except Exception as e:
         log("warn", "Não foi possível salvar cópia em Enviados:", e)
 
 # ========= IA =========
-
-
 def call_agent_local(from_addr, subject, plain_text, code_block):
     user_prompt = USER_TEMPLATE.format(
         from_addr=from_addr, subject=subject,
@@ -417,7 +396,6 @@ def call_agent_local(from_addr, subject, plain_text, code_block):
         try:
             client = OllamaClient(OLLAMA_HOST, OLLAMA_MODEL)
             data = client.generate_json(SYSTEM_PROMPT, user_prompt)
-            # fallback para assegurar chaves
             return {
                 "assunto": data.get("assunto", f"Re: {subject[:200]}"),
                 "corpo_markdown": data.get("corpo_markdown", "Obrigado pelo contato!"),
@@ -438,12 +416,10 @@ def call_agent_local(from_addr, subject, plain_text, code_block):
         "assunto": f"Re: {subject[:200]}",
         "corpo_markdown": body,
         "nivel_confianca": 0.5,
-        "acao": "escalar"  # por segurança, escalar quando não há IA local
+        "acao": "escalar"
     }
 
 # ========= Loop principal =========
-
-
 def main_loop():
     require_env()
     print("Watcher IMAP — envio via SMTP HostGator")
@@ -460,23 +436,20 @@ def main_loop():
                 if typ != "OK":
                     continue
                 raw = data[0][1]
-                msg, msgid, from_addr, subject, plain_text, code_block = parse_message(
-                    raw)
+                msg, msgid, from_addr, subject, plain_text, code_block = parse_message(raw)
                 if not msgid:
                     msgid = f"no-id-{num.decode()}-{int(time.time())}"
                 if already_processed(msgid):
                     continue
 
-                ai = call_agent_local(from_addr, subject,
-                                      plain_text, code_block)
+                ai = call_agent_local(from_addr, subject, plain_text, code_block)
                 action = ai.get("acao", "escalar")
                 confidence = float(ai.get("nivel_confianca", 0.0))
                 log("info", f"Ação={action} conf={confidence}")
 
                 if action == "responder" and confidence >= CONFIDENCE_THRESHOLD:
                     first = guess_first_name(from_addr)
-                    full_body = wrap_with_signature(
-                        first, ai["corpo_markdown"])
+                    full_body = wrap_with_signature(first, ai["corpo_markdown"])
                     reply_subject = make_reply_subject(subject)
                     log("info", f"Assunto final (reply): {reply_subject}")
                     send_reply(msg, from_addr, reply_subject, full_body)
@@ -484,12 +457,10 @@ def main_loop():
                     log("info", f"Chamando move_message -> {FOLDER_PROCESSED}")
                     ok = move_message(imap, num, FOLDER_PROCESSED)
                     if not ok:
-                        log("warn",
-                            f"Não consegui mover para {FOLDER_PROCESSED}. Fallback: {FOLDER_ESCALATE}")
+                        log("warn", f"Não consegui mover para {FOLDER_PROCESSED}. Fallback: {FOLDER_ESCALATE}")
                         move_message(imap, num, FOLDER_ESCALATE)
                 else:
-                    log("info",
-                        f"Chamando move_message -> {FOLDER_ESCALATE} (ação={action}, conf={confidence})")
+                    log("info", f"Chamando move_message -> {FOLDER_ESCALATE} (ação={action}, conf={confidence})")
                     move_message(imap, num, FOLDER_ESCALATE)
 
                 mark_processed(msgid)
@@ -503,8 +474,6 @@ def main_loop():
         time.sleep(CHECK_INTERVAL)
 
 # ========= HTTP (Render Free) =========
-
-
 def imap_self_check():
     try:
         imap = connect_imap()
@@ -516,7 +485,6 @@ def imap_self_check():
         return True, f"IMAP OK. UNSEEN={count}"
     except Exception as e:
         return False, f"IMAP FAIL: {repr(e)}"
-
 
 def create_http_app():
     app = Flask(__name__)
@@ -533,6 +501,8 @@ def create_http_app():
     def status():
         return jsonify({
             "imap_host": IMAP_HOST,
+            "imap_port": IMAP_PORT,
+            "imap_tls_mode": IMAP_TLS_MODE,
             "smtp_host": SMTP_HOST,
             "smtp_mode": SMTP_TLS_MODE,
             "model": OLLAMA_MODEL,
@@ -547,8 +517,35 @@ def create_http_app():
         code = 200 if ok else 500
         return jsonify({"ok": ok, "msg": msg}), code
 
-    return app
+    # ===== novas rotas de diagnóstico =====
+    @app.get("/diag/env")
+    def diag_env():
+        def mask(s):
+            if not s:
+                return ""
+            return s[:2] + "***" + s[-2:]
+        return jsonify({
+            "imap_host": IMAP_HOST,
+            "imap_port": IMAP_PORT,
+            "imap_tls_mode": IMAP_TLS_MODE,
+            "mail_user": MAIL_USER,
+            "mail_user_hex": (MAIL_USER or "").encode("utf-8").hex(),
+            "mail_pass_len": len(MAIL_PASS or ""),
+            "smtp_host": SMTP_HOST,
+            "smtp_port": SMTP_PORT,
+            "smtp_tls_mode": SMTP_TLS_MODE,
+        }), 200
 
+    @app.get("/diag/imap-auth")
+    def diag_imap_auth():
+        try:
+            im = connect_imap()  # já faz login
+            im.logout()
+            return jsonify({"ok": True, "msg": "LOGIN OK"}), 200
+        except Exception as e:
+            return jsonify({"ok": False, "error": repr(e)}), 500
+
+    return app
 
 def run_watcher():
     try:
@@ -556,7 +553,6 @@ def run_watcher():
     except BaseException as e:
         log("error", "Watcher encerrou com erro crítico:", e)
         raise
-
 
 if __name__ == "__main__":
     t = Thread(target=run_watcher, daemon=True)
