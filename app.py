@@ -432,7 +432,7 @@ def main_loop():
             ids = fetch_unseen(imap)
             log("debug", f"UNSEEN: {ids}")
             for num in ids:
-                typ, data = imap.fetch(num, '(RFC822)')
+                typ, data = imap.fetch(num, '(BODY.PEEK[])')
                 if typ != "OK":
                     continue
                 raw = data[0][1]
