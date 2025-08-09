@@ -387,7 +387,7 @@ def send_reply(original_msg, to_addr, reply_subject, body_markdown):
         log("warn", "Não foi possível salvar cópia em Enviados:", e)
 
 # ========= IA =========
-def call_agent_local(from_addr, subject, plain_text, code_block):
+""" def call_agent_local(from_addr, subject, plain_text, code_block):
     user_prompt = USER_TEMPLATE.format(
         from_addr=from_addr, subject=subject,
         plain_text=plain_text[:8000], code_block=code_block[:8000]
@@ -418,6 +418,91 @@ def call_agent_local(from_addr, subject, plain_text, code_block):
         "nivel_confianca": 0.5,
         "acao": "escalar"
     }
+"""
+
+# ========= IA (OpenRouter / Ollama / Fallback) =========
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
+OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "COBOL Support Agent")
+
+def _ask_openrouter(system_prompt: str, user_prompt: str):
+    import requests, json
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    if OPENROUTER_SITE_URL:
+        headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+    if OPENROUTER_APP_NAME:
+        headers["X-Title"] = OPENROUTER_APP_NAME
+
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role":"system", "content": SYSTEM_PROMPT},
+            {"role":"user", "content": user_prompt}
+        ],
+        "temperature": 0.2,
+        "response_format": {"type":"json_object"}
+    }
+    r = requests.post(url, json=payload, timeout=60)
+    if r.status_code in (402, 429):
+        raise RuntimeError(f"OpenRouter limit: {r.status_code} {r.text[:200]}")
+    r.raise_for_status()
+    data = r.json()
+    content = data["choices"][0]["message"]["content"]
+    return json.loads(content)
+
+def call_agent_local(from_addr, subject, plain_text, code_block):
+    user_prompt = USER_TEMPLATE.format(
+        from_addr=from_addr, subject=subject,
+        plain_text=plain_text[:8000], code_block=code_block[:8000]
+    )
+
+    # 1) OpenRouter
+    if os.getenv("LLM_BACKEND","").lower() == "openrouter" and OPENROUTER_API_KEY:
+        try:
+            data = _ask_openrouter(SYSTEM_PROMPT, user_prompt)
+            return {
+                "assunto": data.get("assunto", f"Re: {subject[:200]}"),
+                "corpo_markdown": data.get("corpo_markdown", "Obrigado pelo contato!"),
+                "nivel_confianca": float(data.get("nivel_confianca", 0.0)),
+                "acao": data.get("acao", "escalar")
+            }
+        except Exception as e:
+            log("warn", "Falha no OpenRouter:", e)
+
+    # 2) Ollama local (se algum dia rodar em outra infra)
+    if LLM_BACKEND == "ollama" and OllamaClient is not None:
+        try:
+            client = OllamaClient(OLLAMA_HOST, OLLAMA_MODEL)
+            data = client.generate_json(SYSTEM_PROMPT, user_prompt)
+            return {
+                "assunto": data.get("assunto", f"Re: {subject[:200]}"),
+                "corpo_markdown": data.get("corpo_markdown", "Obrigado pelo contato!"),
+                "nivel_confianca": float(data.get("nivel_confianca", 0.0)),
+                "acao": data.get("acao", "escalar")
+            }
+        except Exception as e:
+            log("warn", "Falha no Ollama:", e)
+
+    # 3) Fallback (sem IA)
+    body = (
+        "- Obrigado por enviar seu código/erro.\n"
+        "- Verifique divisões (IDENTIFICATION/DATA/PROCEDURE), níveis e PIC.\n"
+        "- Para I/O, confirme OPEN/READ/WRITE/CLOSE e status codes.\n"
+        "- Se puder, anexe seu .COB/.CBL para revisão pontual.\n"
+    )
+    return {
+        "assunto": f"Re: {subject[:200]}",
+        "corpo_markdown": body,
+        "nivel_confianca": 0.5,
+        "acao": "escalar"
+    }
+
+
 
 # ========= Loop principal =========
 def main_loop():
