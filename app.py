@@ -1,4 +1,4 @@
-# app.py - Versão 6.2 (Render + OpenRouter + IMAP PEEK + diagnósticos + parser robusto)
+# app.py - Versão 6.2 (Render + OpenRouter + IMAP PEEK + parser robusto + dryrun)
 import os
 import ssl
 import time
@@ -8,13 +8,14 @@ import smtplib
 import email
 import re
 import imaplib
+import traceback
 from email import policy
 from email.parser import BytesParser
 from email.message import EmailMessage
 from markdown import markdown
 from dotenv import load_dotenv
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from threading import Thread
 
 # ======= PROMPTS/LLM (opcional) =======
@@ -23,19 +24,29 @@ try:
 except Exception:
     SYSTEM_PROMPT = (
         "Você é um assistente de suporte de um curso de COBOL. "
-        "Gere respostas úteis, educadas, e diretas; se houver código, aponte erros específicos. "
-        "Analise o e-mail (texto e possível código). Responda educadamente. "
+        "SEMPRE produza um JSON VÁLIDO e nada além disso. "
+        "Formato do JSON (minificado, sem comentários, sem markdown, sem texto extra): "
+        '{"assunto": "...", "corpo_markdown": "...", "nivel_confianca": 0.0, "acao": "responder|escalar"} '
+        "Regras: "
+        "1) NUNCA inclua crases ou ``` no output. "
+        "2) NUNCA acrescente explicações fora do JSON. "
+        "3) Sempre use chaves exatamente como no esquema. "
+        "4) PT-BR no corpo. "
+        "5) 'nivel_confianca' entre 0 e 1. "
+        "6) Se pedido estiver claro e respondível, 'acao'='responder' com nivel_confianca>=0.8; "
+        "   se ambíguo/incompleto, 'acao'='escalar' com nivel_confianca<=0.6."
+        "Analise o e-mail (texto e código anexo ou no corpo do e-mail). Responda educadamente. "
         "Cite pontos do COBOL (DIVISION, SECTION, PIC, níveis, I/O, SQLCA etc.). "
         "Sugira passos práticos. Se no e-mail tiver qualquer solicitação para entrar no grupo do Telegram, dê o link 'https://t.me/aprendacobol'. "
         "Sempre ofereça o curso de Formação Completa de Programadore Aprenda COBOl disponível por assinatura em: https://assinatura.aprendacobol.com.br. "
-        "Retorne um JSON com as chaves: assunto, corpo_markdown, nivel_confianca (0..1), acao ('responder'|'escalar')."
     )
     USER_TEMPLATE = (
         "De: {from_addr}\nAssunto: {subject}\n"
         "Texto:\n{plain_text}\n\nCódigo:\n{code_block}\n"
-        "Responda em PT-BR. Se o pedido for claro, 'acao'='responder' com nivel_confianca>=0.8.\n"
-        "Se estiver ambíguo/faltando anexos, 'acao'='escalar' com nivel_confianca<=0.6."
+        "Responda em PT-BR no JSON especificado e NADA mais. "
+        "Sem explicações externas, sem cercas de código."
     )
+
 # LLM local via Ollama (se indisponível no Render, app segue com fallback)
 try:
     from ollama_client import OllamaClient
@@ -65,10 +76,9 @@ LLM_BACKEND = os.getenv("LLM_BACKEND", "openrouter").lower()  # openrouter|ollam
 # OpenRouter
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/auto")
+# Cabeçalhos de boa prática
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")  # ex.: https://cobol-support-agent-cloud-hostgator.onrender.com
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "COBOL Support Agent")
-OPENROUTER_MAX_TOKENS = int(os.getenv("OPENROUTER_MAX_TOKENS", "512"))
-OPENROUTER_TEMPERATURE = float(os.getenv("OPENROUTER_TEMPERATURE", "0.1"))
 
 # Ollama (apenas se rodar fora do Render)
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
@@ -78,7 +88,7 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
 FOLDER_PROCESSED = os.getenv("FOLDER_PROCESSED", "Respondidos")
 FOLDER_ESCALATE = os.getenv("FOLDER_ESCALATE", "Escalar")
-CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.65"))
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))  # 0.5 p/ testar; depois suba para 0.65
 EXPUNGE_AFTER_COPY = os.getenv("EXPUNGE_AFTER_COPY", "false").lower() == "true"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "info").lower()
 PORT = int(os.getenv("PORT", "10000"))
@@ -257,7 +267,7 @@ def move_message(imap, num, dest_folder):
     existing = _list_mailboxes_once(imap)
     candidates = [dest_folder]
     for sep in ("/", "."):
-        if not dest_folder.upper().startsWith("INBOX") if hasattr(str, "startsWith") else not dest_folder.upper().startswith("INBOX"):
+        if not dest_folder.upper().startswith("INBOX"):
             candidates.append(f"INBOX{sep}{dest_folder}")
 
     existing_names = list(existing.keys())
@@ -408,86 +418,122 @@ def send_reply(original_msg, to_addr, reply_subject, body_markdown):
     except Exception as e:
         log("warn", "Não foi possível salvar cópia em Enviados:", e)
 
-# ========= Helpers de JSON robusto =========
-def _salvage_json_object(text: str):
+# ========= Helpers de JSON do LLM =========
+_CURLY_BLOCK_RE = re.compile(r'\{(?:[^{}]|(?R))*\}', re.DOTALL)
+
+def _strip_fences(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.lstrip("`")
+        # remove linguagem, se houver
+        t = re.sub(r'^[a-zA-Z0-9_-]*\n', '', t, count=1)
+        # corta até o próximo ```
+        parts = t.split("```")
+        t = parts[0] if parts else t
+    return t.strip()
+
+def parse_ai_json(raw_text: str):
     """
-    Tenta encontrar o MAIOR bloco JSON { ... } balanceado dentro de `text`.
-    Retorna dict se conseguir, senão None.
+    Tenta carregar JSON do LLM com tolerância:
+    1) remove cercas de código
+    2) tenta json.loads direto
+    3) extrai primeiro bloco {...} via regex e tenta novamente
     """
-    if not text:
-        return None
-    start_positions = [i for i, ch in enumerate(text) if ch == "{"]
-    for start in start_positions:
-        depth = 0
-        for i in range(start, len(text)):
-            ch = text[i]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = text[start:i+1]
-                    try:
-                        return json.loads(candidate)
-                    except Exception:
-                        pass
-    return None
+    if raw_text is None:
+        raise ValueError("Resposta vazia do LLM")
+
+    # remove BOM e cercas
+    text = raw_text.replace("\ufeff", "").strip()
+    text = _strip_fences(text)
+
+    # tentativa direta
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # extrai primeiro bloco {...}
+    m = _CURLY_BLOCK_RE.search(text)
+    if m:
+        snippet = m.group(0)
+        try:
+            return json.loads(snippet)
+        except Exception:
+            pass
+
+    # nada feito: levanta erro com preview
+    preview = text[:1200]
+    raise ValueError(f"Falha ao parsear JSON do modelo: preview={preview}")
 
 # ========= IA (OpenRouter / Ollama / Fallback) =========
-def _ask_openrouter(system_prompt: str, user_prompt: str):
-    import requests
-    url = "https://openrouter.ai/api/v1/chat/completions"
+def _openrouter_headers():
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
+    # boas práticas
     if OPENROUTER_SITE_URL:
         headers["HTTP-Referer"] = OPENROUTER_SITE_URL
     if OPENROUTER_APP_NAME:
         headers["X-Title"] = OPENROUTER_APP_NAME
+    return headers
 
+def _ask_openrouter_raw(system_prompt: str, user_prompt: str, retry_reason: str = ""):
+    """
+    Retorna o 'content' bruto do message do OpenRouter (string).
+    """
+    import requests
+    url = "https://openrouter.ai/api/v1/chat/completions"
+
+    headers = _openrouter_headers()
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
-        "temperature": OPENROUTER_TEMPERATURE,
-        "response_format": {"type": "json_object"},
-        "max_tokens": OPENROUTER_MAX_TOKENS
+        "temperature": 0.0,
+        "max_tokens": 800,
+        "response_format": {"type": "json_object"}
     }
 
+    # Em retentativa, reforça instrução
+    if retry_reason:
+        payload["messages"].append({
+            "role": "system",
+            "content": (
+                "Atenção: a resposta anterior não era JSON válido. "
+                "Responda AGORA estritamente com UM JSON válido e minificado, sem cercas, sem texto extra."
+            )
+        })
+
     r = requests.post(url, json=payload, headers=headers, timeout=60)
-    # Trate limites e rate-limit explicitamente (não faça raise Aqui)
     if r.status_code in (402, 429):
-        raise RuntimeError(f"OpenRouter limit: {r.status_code} {r.text[:300]}")
+        raise RuntimeError(f"OpenRouter limit: {r.status_code} {r.text[:200]}")
     r.raise_for_status()
-
     data = r.json()
-    content = data["choices"][0]["message"]["content"]
+    return data["choices"][0]["message"]["content"]
 
-    # 1) Tenta JSON direto
+def _ask_openrouter(system_prompt: str, user_prompt: str):
+    """
+    Faz 1 chamada; se JSON inválido, faz 1 retentativa.
+    Retorna dict com chaves: assunto, corpo_markdown, nivel_confianca, acao
+    """
+    # 1ª tentativa
     try:
-        return json.loads(content)
+        content = _ask_openrouter_raw(system_prompt, user_prompt)
+        return parse_ai_json(content)
     except Exception as e1:
-        # 2) Log curto do conteúdo bruto (truncado) e tentar “salvar” um objeto
-        preview = content[:1200].replace("\n", "\\n")
-        log("warn", f"JSON inválido do modelo (preview 1.2KB): {preview}")
-        salvaged = _salvage_json_object(content)
-        if salvaged is not None:
-            log("info", "JSON recuperado via _salvage_json_object.")
-            return salvaged
+        log("warn", f"Falha no OpenRouter (1ª): {e1}")
 
-        # 3) Última tentativa: procurar primeiro par de chaves simples com regex
-        try:
-            m = re.search(r"\{[\s\S]*\}", content)
-            if m:
-                return json.loads(m.group(0))
-        except Exception:
-            pass
-
-        # 4) Nada feito -> propaga erro para o chamador lidar (fallback para escalar)
-        raise RuntimeError(f"Falha ao parsear JSON do modelo: {e1}")
+    # 2ª tentativa com reforço
+    try:
+        content2 = _ask_openrouter_raw(system_prompt, user_prompt, retry_reason="bad_json")
+        return parse_ai_json(content2)
+    except Exception as e2:
+        # loga trecho para diagnóstico
+        log("warn", f"Falha no OpenRouter (2ª): {e2}")
+        raise
 
 def call_agent_local(from_addr, subject, plain_text, code_block):
     user_prompt = USER_TEMPLATE.format(
@@ -563,8 +609,9 @@ def main_loop():
                 try:
                     ai = call_agent_local(from_addr, subject, plain_text, code_block)
                 except Exception as e:
-                    log("warn", "Erro no agente, caindo para ESCALAR:", e)
-                    ai = {"assunto": f"Re: {subject[:200]}", "corpo_markdown": "", "nivel_confianca": 0.0, "acao": "escalar"}
+                    # erro crítico de LLM => escalonar
+                    log("warn", f"LLM_JSON_PARSE_ERROR: {e}")
+                    ai = {"acao": "escalar", "nivel_confianca": 0.5, "assunto": subject, "corpo_markdown": ""}
 
                 action = ai.get("acao", "escalar")
                 confidence = float(ai.get("nivel_confianca", 0.0))
@@ -572,7 +619,7 @@ def main_loop():
 
                 if action == "responder" and confidence >= CONFIDENCE_THRESHOLD:
                     first = guess_first_name(from_addr)
-                    full_body = wrap_with_signature(first, ai["corpo_markdown"])
+                    full_body = wrap_with_signature(first, ai.get("corpo_markdown", ""))
                     reply_subject = make_reply_subject(subject)
                     log("info", f"Assunto final (reply): {reply_subject}")
                     send_reply(msg, from_addr, reply_subject, full_body)
@@ -594,6 +641,7 @@ def main_loop():
             imap.logout()
         except Exception as e:
             log("error", "Erro no loop:", e)
+            traceback.print_exc()
         time.sleep(CHECK_INTERVAL)
 
 # ========= HTTP (Render Free) =========
@@ -633,7 +681,8 @@ def create_http_app():
             "model_openrouter": OPENROUTER_MODEL,
             "model_ollama": OLLAMA_MODEL,
             "processed_folder": FOLDER_PROCESSED,
-            "escalate_folder": FOLDER_ESCALATE
+            "escalate_folder": FOLDER_ESCALATE,
+            "confidence_threshold": CONFIDENCE_THRESHOLD
         }), 200
 
     @app.get("/diag/imap")
@@ -656,76 +705,78 @@ def create_http_app():
             "smtp_tls_mode": SMTP_TLS_MODE,
             "llm_backend": LLM_BACKEND,
             "openrouter_model": OPENROUTER_MODEL if OPENROUTER_API_KEY else "(sem chave)",
-            "openrouter_max_tokens": OPENROUTER_MAX_TOKENS,
-            "openrouter_temperature": OPENROUTER_TEMPERATURE
+            "site_url_header": OPENROUTER_SITE_URL,
+            "x_title_header": OPENROUTER_APP_NAME
         }), 200
 
+    @app.get("/diag/imap-auth")
+    def diag_imap_auth():
+        try:
+            im = connect_imap()  # já faz login
+            im.logout()
+            return jsonify({"ok": True, "msg": "LOGIN OK"}), 200
+        except Exception as e:
+            return jsonify({"ok": False, "error": repr(e)}), 500
+
     @app.get("/diag/openrouter")
-    def diag_openrouter():
-        # Diagnóstico simples: só ecoa headers que vamos enviar normalmente
-        hdrs = {}
-        if OPENROUTER_SITE_URL:
-            hdrs["HTTP-Referer"] = OPENROUTER_SITE_URL
-        if OPENROUTER_APP_NAME:
-            hdrs["X-Title"] = OPENROUTER_APP_NAME
-        return jsonify({"headers_would_send": hdrs, "model": OPENROUTER_MODEL}), 200
+    def diag_openrouter_headers():
+        # Mostra como os headers seriam enviados (sem a chave)
+        hdrs = _openrouter_headers()
+        safe_hdrs = {k: ("***" if k.lower() == "authorization" else v) for k, v in hdrs.items()}
+        return jsonify({"headers": safe_hdrs, "model": OPENROUTER_MODEL}), 200
 
     @app.get("/diag/openrouter-chat")
     def diag_openrouter_chat():
-        """
-        Faz uma chamadinha real com payload mínimo, para validar:
-        - headers obrigatórios
-        - key OK
-        - status do endpoint
-        """
-        import requests
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        if OPENROUTER_SITE_URL:
-            headers["HTTP-Referer"] = OPENROUTER_SITE_URL
-        if OPENROUTER_APP_NAME:
-            headers["X-Title"] = OPENROUTER_APP_NAME
-
-        payload = {
-            "model": OPENROUTER_MODEL,
-            "messages": [{"role": "user", "content": "eco: teste"}],
-            "max_tokens": 32,
-            "temperature": 0,
-        }
+        # Chamada leve só p/ eco
         try:
-            r = requests.post(url, json=payload, headers=headers, timeout=30)
-            ok = r.ok
-            body_text = None
-            body_json = None
-            try:
-                body_json = r.json()
-            except Exception:
-                body_text = r.text[:1000]
+            content = _ask_openrouter_raw(
+                "Responda estritamente com JSON {'eco':'teste','ok':true}. Sem cercas, sem texto extra.",
+                "eco por favor"
+            )
             return jsonify({
-                "ok": ok,
-                "status": r.status_code,
+                "ok": True,
                 "model": OPENROUTER_MODEL,
-                "headers_sent": {
-                    "HTTP-Referer": headers.get("HTTP-Referer"),
-                    "Referer": headers.get("HTTP-Referer"),
-                    "X-Title": headers.get("X-Title")
-                },
-                "body_json": body_json,
-                "body_text": body_text
-            }), (200 if ok else 500)
+                "headers_sent": {k: v for k, v in _openrouter_headers().items() if k != "Authorization"},
+                "body_text": content,
+                "body_json": parse_ai_json(content)
+            }), 200
         except Exception as e:
             return jsonify({
                 "ok": False,
                 "model": OPENROUTER_MODEL,
+                "headers_sent": {k: v for k, v in _openrouter_headers().items() if k != "Authorization"},
+                "error": str(e)
+            }), 500
+
+    @app.get("/diag/llm-dryrun")
+    def diag_llm_dryrun():
+        """
+        Simula um ticket curto para validar o JSON end-to-end.
+        """
+        sample_from = "aluno@exemplo.com"
+        sample_subject = "Erro em READ do arquivo"
+        sample_text = (
+            "Estou recebendo file status 35 ao fazer READ. "
+            "O arquivo foi aberto com OPEN INPUT. Preciso corrigir."
+        )
+        sample_code = "```cobol\nREAD CLIENTES AT END MOVE 1 TO EOF-FLAG.\n```"
+        user_prompt = USER_TEMPLATE.format(
+            from_addr=sample_from, subject=sample_subject,
+            plain_text=sample_text, code_block=sample_code
+        )
+        try:
+            raw = _ask_openrouter_raw(SYSTEM_PROMPT, user_prompt)
+            parsed = parse_ai_json(raw)
+            return jsonify({
+                "ok": True,
+                "raw_preview": raw[:1200],
+                "parsed": parsed
+            }), 200
+        except Exception as e:
+            return jsonify({
+                "ok": False,
                 "error": str(e),
-                "headers_sent": {
-                    "HTTP-Referer": headers.get("HTTP-Referer"),
-                    "Referer": headers.get("HTTP-Referer"),
-                    "X-Title": headers.get("X-Title")
-                }
+                "trace": traceback.format_exc()[-1000:]
             }), 500
 
     return app
