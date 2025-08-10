@@ -419,30 +419,61 @@ def send_reply(original_msg, to_addr, reply_subject, body_markdown):
         log("warn", "Não foi possível salvar cópia em Enviados:", e)
 
 # ========= Helpers de JSON do LLM =========
-_CURLY_BLOCK_RE = re.compile(r'\{(?:[^{}]|(?R))*\}', re.DOTALL)
-
 def _strip_fences(text: str) -> str:
-    t = text.strip()
+    t = (text or "").strip()
     if t.startswith("```"):
+        # remove cercas iniciais e linguagem, se houver
         t = t.lstrip("`")
-        # remove linguagem, se houver
         t = re.sub(r'^[a-zA-Z0-9_-]*\n', '', t, count=1)
-        # corta até o próximo ```
         parts = t.split("```")
         t = parts[0] if parts else t
     return t.strip()
+
+def _extract_first_json_object(s: str) -> str | None:
+    """
+    Retorna o primeiro objeto JSON bem-balanceado encontrado em s (de '{' até o '}' correspondente),
+    ignorando chaves dentro de strings. Considera escapes \" dentro de strings.
+    """
+    if not s:
+        return None
+    s = s.strip()
+    start = s.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start:i+1]
+    return None
 
 def parse_ai_json(raw_text: str):
     """
     Tenta carregar JSON do LLM com tolerância:
     1) remove cercas de código
     2) tenta json.loads direto
-    3) extrai primeiro bloco {...} via regex e tenta novamente
+    3) extrai primeiro bloco {...} via contador de chaves e tenta novamente
     """
     if raw_text is None:
         raise ValueError("Resposta vazia do LLM")
 
-    # remove BOM e cercas
     text = raw_text.replace("\ufeff", "").strip()
     text = _strip_fences(text)
 
@@ -452,16 +483,14 @@ def parse_ai_json(raw_text: str):
     except Exception:
         pass
 
-    # extrai primeiro bloco {...}
-    m = _CURLY_BLOCK_RE.search(text)
-    if m:
-        snippet = m.group(0)
+    # extrai primeiro objeto {...}
+    snippet = _extract_first_json_object(text)
+    if snippet:
         try:
             return json.loads(snippet)
         except Exception:
             pass
 
-    # nada feito: levanta erro com preview
     preview = text[:1200]
     raise ValueError(f"Falha ao parsear JSON do modelo: preview={preview}")
 
