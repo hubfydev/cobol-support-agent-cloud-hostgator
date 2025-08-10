@@ -1,4 +1,4 @@
-# app.py - Versão 6.2 (Render + OpenRouter headers + max_tokens + IMAP PEEK + diagnósticos)
+# app.py - Versão 6.2 (Render + OpenRouter + IMAP PEEK + diagnósticos + parser robusto)
 import os
 import ssl
 import time
@@ -14,7 +14,7 @@ from email.message import EmailMessage
 from markdown import markdown
 from dotenv import load_dotenv
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 from threading import Thread
 
 # ======= PROMPTS/LLM (opcional) =======
@@ -36,7 +36,6 @@ except Exception:
         "Responda em PT-BR. Se o pedido for claro, 'acao'='responder' com nivel_confianca>=0.8.\n"
         "Se estiver ambíguo/faltando anexos, 'acao'='escalar' com nivel_confianca<=0.6."
     )
-
 # LLM local via Ollama (se indisponível no Render, app segue com fallback)
 try:
     from ollama_client import OllamaClient
@@ -62,18 +61,14 @@ SENT_FOLDER = os.getenv("SENT_FOLDER", "INBOX.Sent")  # tentaremos normalizar
 
 # -------- LLM (OpenRouter / Ollama) --------
 LLM_BACKEND = os.getenv("LLM_BACKEND", "openrouter").lower()  # openrouter|ollama
+
 # OpenRouter
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-# Se quiser garantir free, defina no Render: meta-llama/llama-3.1-8b-instruct:free
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
-# Boas práticas de header
-# Mantém compat com variáveis antigas e novas
-OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/auto")
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")  # ex.: https://cobol-support-agent-cloud-hostgator.onrender.com
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "COBOL Support Agent")
-APP_PUBLIC_URL = os.getenv("APP_PUBLIC_URL", OPENROUTER_SITE_URL)
-APP_TITLE = os.getenv("APP_TITLE", OPENROUTER_APP_NAME)
-# Limitar tokens para evitar 402 no tier free
 OPENROUTER_MAX_TOKENS = int(os.getenv("OPENROUTER_MAX_TOKENS", "512"))
+OPENROUTER_TEMPERATURE = float(os.getenv("OPENROUTER_TEMPERATURE", "0.1"))
 
 # Ollama (apenas se rodar fora do Render)
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
@@ -183,7 +178,7 @@ def parse_message(raw_bytes):
             payload = m.get_payload(decode=True) or b""
             try:
                 text = payload.decode(m.get_content_charset() or "utf-8", errors="ignore")
-            except Exception:
+            except:
                 text = ""
             if filename and filename.lower().endswith((".cob", ".cbl", ".txt")):
                 code_chunks.append(f"--- {filename} ---\n{text}")
@@ -262,7 +257,7 @@ def move_message(imap, num, dest_folder):
     existing = _list_mailboxes_once(imap)
     candidates = [dest_folder]
     for sep in ("/", "."):
-        if not dest_folder.upper().startswith("INBOX"):
+        if not dest_folder.upper().startsWith("INBOX") if hasattr(str, "startsWith") else not dest_folder.upper().startswith("INBOX"):
             candidates.append(f"INBOX{sep}{dest_folder}")
 
     existing_names = list(existing.keys())
@@ -413,21 +408,41 @@ def send_reply(original_msg, to_addr, reply_subject, body_markdown):
     except Exception as e:
         log("warn", "Não foi possível salvar cópia em Enviados:", e)
 
+# ========= Helpers de JSON robusto =========
+def _salvage_json_object(text: str):
+    """
+    Tenta encontrar o MAIOR bloco JSON { ... } balanceado dentro de `text`.
+    Retorna dict se conseguir, senão None.
+    """
+    if not text:
+        return None
+    start_positions = [i for i, ch in enumerate(text) if ch == "{"]
+    for start in start_positions:
+        depth = 0
+        for i in range(start, len(text)):
+            ch = text[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:i+1]
+                    try:
+                        return json.loads(candidate)
+                    except Exception:
+                        pass
+    return None
+
 # ========= IA (OpenRouter / Ollama / Fallback) =========
 def _ask_openrouter(system_prompt: str, user_prompt: str):
     import requests
-
     url = "https://openrouter.ai/api/v1/chat/completions"
-    max_tokens = int(os.getenv("OPENROUTER_MAX_TOKENS", "512"))
-
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
-    # Cabeçalhos recomendados pelo OpenRouter (opcionais, mas úteis)
-    if APP_PUBLIC_URL:
-        headers["HTTP-Referer"] = APP_PUBLIC_URL
-        headers["Referer"] = APP_PUBLIC_URL
+    if OPENROUTER_SITE_URL:
+        headers["HTTP-Referer"] = OPENROUTER_SITE_URL
     if OPENROUTER_APP_NAME:
         headers["X-Title"] = OPENROUTER_APP_NAME
 
@@ -437,20 +452,42 @@ def _ask_openrouter(system_prompt: str, user_prompt: str):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
-        "temperature": 0.2,
+        "temperature": OPENROUTER_TEMPERATURE,
         "response_format": {"type": "json_object"},
-        "max_tokens": max_tokens,
+        "max_tokens": OPENROUTER_MAX_TOKENS
     }
 
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    r = requests.post(url, json=payload, headers=headers, timeout=60)
+    # Trate limites e rate-limit explicitamente (não faça raise Aqui)
     if r.status_code in (402, 429):
-        # 402 = créditos/limite de tokens | 429 = rate limit
-        raise RuntimeError(f"OpenRouter limit: {r.status_code} {r.text[:200]}")
+        raise RuntimeError(f"OpenRouter limit: {r.status_code} {r.text[:300]}")
     r.raise_for_status()
 
     data = r.json()
     content = data["choices"][0]["message"]["content"]
-    return json.loads(content)
+
+    # 1) Tenta JSON direto
+    try:
+        return json.loads(content)
+    except Exception as e1:
+        # 2) Log curto do conteúdo bruto (truncado) e tentar “salvar” um objeto
+        preview = content[:1200].replace("\n", "\\n")
+        log("warn", f"JSON inválido do modelo (preview 1.2KB): {preview}")
+        salvaged = _salvage_json_object(content)
+        if salvaged is not None:
+            log("info", "JSON recuperado via _salvage_json_object.")
+            return salvaged
+
+        # 3) Última tentativa: procurar primeiro par de chaves simples com regex
+        try:
+            m = re.search(r"\{[\s\S]*\}", content)
+            if m:
+                return json.loads(m.group(0))
+        except Exception:
+            pass
+
+        # 4) Nada feito -> propaga erro para o chamador lidar (fallback para escalar)
+        raise RuntimeError(f"Falha ao parsear JSON do modelo: {e1}")
 
 def call_agent_local(from_addr, subject, plain_text, code_block):
     user_prompt = USER_TEMPLATE.format(
@@ -523,7 +560,12 @@ def main_loop():
                 if already_processed(msgid):
                     continue
 
-                ai = call_agent_local(from_addr, subject, plain_text, code_block)
+                try:
+                    ai = call_agent_local(from_addr, subject, plain_text, code_block)
+                except Exception as e:
+                    log("warn", "Erro no agente, caindo para ESCALAR:", e)
+                    ai = {"assunto": f"Re: {subject[:200]}", "corpo_markdown": "", "nivel_confianca": 0.0, "acao": "escalar"}
+
                 action = ai.get("acao", "escalar")
                 confidence = float(ai.get("nivel_confianca", 0.0))
                 log("info", f"Ação={action} conf={confidence}")
@@ -567,7 +609,6 @@ def imap_self_check():
     except Exception as e:
         return False, f"IMAP FAIL: {repr(e)}"
 
-
 def create_http_app():
     app = Flask(__name__)
 
@@ -601,7 +642,6 @@ def create_http_app():
         code = 200 if ok else 500
         return jsonify({"ok": ok, "msg": msg}), code
 
-    # ===== novas rotas de diagnóstico =====
     @app.get("/diag/env")
     def diag_env():
         return jsonify({
@@ -616,72 +656,79 @@ def create_http_app():
             "smtp_tls_mode": SMTP_TLS_MODE,
             "llm_backend": LLM_BACKEND,
             "openrouter_model": OPENROUTER_MODEL if OPENROUTER_API_KEY else "(sem chave)",
-            "app_public_url": APP_PUBLIC_URL,
-            "app_title": APP_TITLE,
             "openrouter_max_tokens": OPENROUTER_MAX_TOKENS,
+            "openrouter_temperature": OPENROUTER_TEMPERATURE
         }), 200
-
-    @app.get("/diag/imap-auth")
-    def diag_imap_auth():
-        try:
-            im = connect_imap()  # já faz login
-            im.logout()
-            return jsonify({"ok": True, "msg": "LOGIN OK"}), 200
-        except Exception as e:
-            return jsonify({"ok": False, "error": repr(e)}), 500
 
     @app.get("/diag/openrouter")
-    def diag_openrouter_headers():
-        # Apenas ecoa o que enviaríamos
-        headers_preview = {
-            "Authorization": f"Bearer {'***' if OPENROUTER_API_KEY else ''}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        if APP_PUBLIC_URL:
-            headers_preview["HTTP-Referer"] = APP_PUBLIC_URL
-            headers_preview["Referer"] = APP_PUBLIC_URL
-        if APP_TITLE:
-            headers_preview["X-Title"] = APP_TITLE
-        return jsonify({
-            "ok": True,
-            "model": OPENROUTER_MODEL,
-            "headers_preview": headers_preview,
-        }), 200
+    def diag_openrouter():
+        # Diagnóstico simples: só ecoa headers que vamos enviar normalmente
+        hdrs = {}
+        if OPENROUTER_SITE_URL:
+            hdrs["HTTP-Referer"] = OPENROUTER_SITE_URL
+        if OPENROUTER_APP_NAME:
+            hdrs["X-Title"] = OPENROUTER_APP_NAME
+        return jsonify({"headers_would_send": hdrs, "model": OPENROUTER_MODEL}), 200
 
     @app.get("/diag/openrouter-chat")
     def diag_openrouter_chat():
-        # Faz uma chamada real e retorna corpo/status para verificar 401/402 etc.
+        """
+        Faz uma chamadinha real com payload mínimo, para validar:
+        - headers obrigatórios
+        - key OK
+        - status do endpoint
+        """
+        import requests
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        if OPENROUTER_SITE_URL:
+            headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+        if OPENROUTER_APP_NAME:
+            headers["X-Title"] = OPENROUTER_APP_NAME
+
+        payload = {
+            "model": OPENROUTER_MODEL,
+            "messages": [{"role": "user", "content": "eco: teste"}],
+            "max_tokens": 32,
+            "temperature": 0,
+        }
         try:
-            data = _ask_openrouter(
-                "Você é um verificador.",
-                "Responda com um JSON: {\"ok\": true, \"eco\": \"teste\"}."
-            )
+            r = requests.post(url, json=payload, headers=headers, timeout=30)
+            ok = r.ok
+            body_text = None
+            body_json = None
+            try:
+                body_json = r.json()
+            except Exception:
+                body_text = r.text[:1000]
             return jsonify({
-                "ok": True,
+                "ok": ok,
+                "status": r.status_code,
                 "model": OPENROUTER_MODEL,
-                "body_json": data,
                 "headers_sent": {
-                    "HTTP-Referer": APP_PUBLIC_URL,
-                    "Referer": APP_PUBLIC_URL,
-                    "X-Title": APP_TITLE,
-                }
-            }), 200
+                    "HTTP-Referer": headers.get("HTTP-Referer"),
+                    "Referer": headers.get("HTTP-Referer"),
+                    "X-Title": headers.get("X-Title")
+                },
+                "body_json": body_json,
+                "body_text": body_text
+            }), (200 if ok else 500)
         except Exception as e:
-            # Quando capturamos exceções do _ask_openrouter (inclui 402/429 raise_for_status)
             return jsonify({
                 "ok": False,
                 "model": OPENROUTER_MODEL,
                 "error": str(e),
                 "headers_sent": {
-                    "HTTP-Referer": APP_PUBLIC_URL,
-                    "Referer": APP_PUBLIC_URL,
-                    "X-Title": APP_TITLE,
+                    "HTTP-Referer": headers.get("HTTP-Referer"),
+                    "Referer": headers.get("HTTP-Referer"),
+                    "X-Title": headers.get("X-Title")
                 }
             }), 500
 
     return app
-
 
 def run_watcher():
     try:
@@ -689,7 +736,6 @@ def run_watcher():
     except BaseException as e:
         log("error", "Watcher encerrou com erro crítico:", e)
         raise
-
 
 if __name__ == "__main__":
     t = Thread(target=run_watcher, daemon=True)
