@@ -712,3 +712,41 @@ if __name__ == "__main__":
     t.start()
     app = create_http_app()
     app.run(host="0.0.0.0", port=PORT)
+
+# depois dos outros envs:
+OPENROUTER_MAX_TOKENS = int(os.getenv("OPENROUTER_MAX_TOKENS", "512"))
+
+# ...
+
+def _ask_openrouter(system_prompt: str, user_prompt: str):
+    import requests
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if APP_PUBLIC_URL:
+        headers["HTTP-Referer"] = APP_PUBLIC_URL
+        headers["Referer"] = APP_PUBLIC_URL
+    if APP_TITLE:
+        headers["X-Title"] = APP_TITLE
+
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+        "max_tokens": OPENROUTER_MAX_TOKENS,   # <<< limite de saída
+    }
+
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    if r.status_code in (402, 429):
+        raise RuntimeError(f"OpenRouter limit: {r.status_code} {r.text[:200]}")
+    r.raise_for_status()
+    data = r.json()
+    content = data["choices"][0]["message"]["content"]
+    return json.loads(content)
