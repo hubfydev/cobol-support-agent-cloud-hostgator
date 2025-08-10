@@ -416,19 +416,20 @@ def send_reply(original_msg, to_addr, reply_subject, body_markdown):
 # ========= IA (OpenRouter / Ollama / Fallback) =========
 def _ask_openrouter(system_prompt: str, user_prompt: str):
     import requests
-    url = "https://openrouter.ai/api/v1/chat/completions"
 
-headers = {
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    max_tokens = int(os.getenv("OPENROUTER_MAX_TOKENS", "512"))
+
+    headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "Accept": "application/json",
     }
-    # Boas práticas
+    # Cabeçalhos recomendados pelo OpenRouter (opcionais, mas úteis)
     if APP_PUBLIC_URL:
         headers["HTTP-Referer"] = APP_PUBLIC_URL
         headers["Referer"] = APP_PUBLIC_URL
-    if APP_TITLE:
-        headers["X-Title"] = APP_TITLE
+    if OPENROUTER_APP_NAME:
+        headers["X-Title"] = OPENROUTER_APP_NAME
 
     payload = {
         "model": OPENROUTER_MODEL,
@@ -438,14 +439,15 @@ headers = {
         ],
         "temperature": 0.2,
         "response_format": {"type": "json_object"},
-        "max_tokens": OPENROUTER_MAX_TOKENS,
+        "max_tokens": max_tokens,
     }
 
     r = requests.post(url, headers=headers, json=payload, timeout=60)
-    # Trate limites/quotas claramente para o loop entender
     if r.status_code in (402, 429):
-        raise RuntimeError(f"OpenRouter limit: {r.status_code} {r.text[:300]}")
+        # 402 = créditos/limite de tokens | 429 = rate limit
+        raise RuntimeError(f"OpenRouter limit: {r.status_code} {r.text[:200]}")
     r.raise_for_status()
+
     data = r.json()
     content = data["choices"][0]["message"]["content"]
     return json.loads(content)
