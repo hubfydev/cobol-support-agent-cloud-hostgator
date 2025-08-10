@@ -714,7 +714,7 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
 
 # depois dos outros envs:
-OPENROUTER_MAX_TOKENS = int(os.getenv("OPENROUTER_MAX_TOKENS", "512"))
+OPENROUTER_MAX_TOKENS = int(os.getenv("OPENROUTER_MAX_TOKENS", "256"))
 
 # ...
 
