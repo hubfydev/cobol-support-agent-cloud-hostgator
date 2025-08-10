@@ -196,9 +196,9 @@ def parse_message(raw_bytes):
     plain_text = "\n".join(plain_parts).strip()
     code_block = ""
     if code_chunks:
-        code_block = "\n" + "\n\n".join(code_chunks) + "\n"
+        code_block = "```\n" + "\n\n".join(code_chunks) + "\n```"
     elif "IDENTIFICATION DIVISION" in plain_text.upper():
-        code_block = "cobol\n" + plain_text + "\n"
+        code_block = "```cobol\n" + plain_text + "\n```"
     return msg, msgid, from_addr, subject, plain_text, code_block
 
 def guess_first_name(from_addr: str) -> str:
@@ -384,7 +384,7 @@ def make_reply_subject(original_subject: str) -> str:
 
 def wrap_with_signature(first_name: str, body_markdown: str) -> str:
     saud = f"Olá{', ' + first_name if first_name else ''}!\n\n"
-    sig_lines = ["\n---", f"{SIGNATURE_NAME}"]
+    sig_lines = ["\n---", f"**{SIGNATURE_NAME}**"]
     if SIGNATURE_FOOTER:
         sig_lines.append(SIGNATURE_FOOTER)
     if SIGNATURE_LINKS:
@@ -523,7 +523,7 @@ def main_loop():
                 if already_processed(msgid):
                     continue
 
-ai = call_agent_local(from_addr, subject, plain_text, code_block)
+                ai = call_agent_local(from_addr, subject, plain_text, code_block)
                 action = ai.get("acao", "escalar")
                 confidence = float(ai.get("nivel_confianca", 0.0))
                 log("info", f"Ação={action} conf={confidence}")
@@ -569,7 +569,7 @@ def imap_self_check():
 
 
 def create_http_app():
-    app = Flask(name)
+    app = Flask(__name__)
 
     @app.get("/")
     def index():
@@ -630,7 +630,7 @@ def create_http_app():
         except Exception as e:
             return jsonify({"ok": False, "error": repr(e)}), 500
 
-@app.get("/diag/openrouter")
+    @app.get("/diag/openrouter")
     def diag_openrouter_headers():
         # Apenas ecoa o que enviaríamos
         headers_preview = {
@@ -691,7 +691,7 @@ def run_watcher():
         raise
 
 
-if name == "main":
+if __name__ == "__main__":
     t = Thread(target=run_watcher, daemon=True)
     t.start()
     app = create_http_app()
