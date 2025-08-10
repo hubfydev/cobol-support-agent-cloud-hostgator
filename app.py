@@ -1,4 +1,4 @@
-# app.py - Versão 6.2 (Render + OpenRouter headers + IMAP PEEK + diagnósticos)
+# app.py - Versão 6.2 (Render + OpenRouter + IMAP PEEK + diagnósticos extras)
 import os
 import ssl
 import time
@@ -24,6 +24,11 @@ except Exception:
     SYSTEM_PROMPT = (
         "Você é um assistente de suporte de um curso de COBOL. "
         "Gere respostas úteis, educadas, e diretas; se houver código, aponte erros específicos. "
+        "Analise o e-mail (texto e possível código). Responda educadamente, cite
+pontos do COBOL (DIVISION, SECTION, PIC, níveis, I/O, SQLCA etc.) e sugira
+passos práticos. Se no e-mail tiver qualquer solicitação para entrar no grupo do Telegram,
+dê o link "https://t.me/aprendacobol". Sempre ofereça o curso de Formação Completa
+de Programadore Aprenda COBOl disponível por assinatura em: https://assinatura.aprendacobol.com.br."
         "Retorne um JSON com as chaves: assunto, corpo_markdown, nivel_confianca (0..1), acao ('responder'|'escalar')."
     )
     USER_TEMPLATE = (
@@ -62,9 +67,14 @@ LLM_BACKEND = os.getenv("LLM_BACKEND", "openrouter").lower()  # openrouter|ollam
 # OpenRouter
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
-# novos nomes (recomendados) com fallback para os antigos:
-APP_PUBLIC_URL = os.getenv("APP_PUBLIC_URL", os.getenv("OPENROUTER_SITE_URL", ""))  # Referer
-APP_TITLE = os.getenv("APP_TITLE", os.getenv("OPENROUTER_APP_NAME", "COBOL Support Agent"))
+
+# Nomes antigos mantidos por compatibilidade:
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
+OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "COBOL Support Agent")
+
+# Nomes preferidos (com fallback nos antigos):
+APP_PUBLIC_URL = os.getenv("APP_PUBLIC_URL", OPENROUTER_SITE_URL)
+APP_TITLE = os.getenv("APP_TITLE", OPENROUTER_APP_NAME)
 
 # Ollama (apenas se rodar fora do Render)
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
@@ -410,15 +420,14 @@ def send_reply(original_msg, to_addr, reply_subject, body_markdown):
 def _ask_openrouter(system_prompt: str, user_prompt: str):
     import requests
     url = "https://openrouter.ai/api/v1/chat/completions"
-
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
+        "Accept": "application/json",
     }
-    # boas práticas do OpenRouter
     if APP_PUBLIC_URL:
         headers["HTTP-Referer"] = APP_PUBLIC_URL
-        headers["Referer"] = APP_PUBLIC_URL  # extra: alguns proxies só passam este
+        headers["Referer"] = APP_PUBLIC_URL
     if APP_TITLE:
         headers["X-Title"] = APP_TITLE
 
@@ -431,7 +440,6 @@ def _ask_openrouter(system_prompt: str, user_prompt: str):
         "temperature": 0.2,
         "response_format": {"type": "json_object"}
     }
-    # >>> Envia os HEADERS! <<<
     r = requests.post(url, headers=headers, json=payload, timeout=60)
     if r.status_code in (402, 429):
         raise RuntimeError(f"OpenRouter limit: {r.status_code} {r.text[:200]}")
@@ -588,7 +596,6 @@ def create_http_app():
         code = 200 if ok else 500
         return jsonify({"ok": ok, "msg": msg}), code
 
-    # ===== novas rotas de diagnóstico =====
     @app.get("/diag/env")
     def diag_env():
         return jsonify({
@@ -616,21 +623,79 @@ def create_http_app():
         except Exception as e:
             return jsonify({"ok": False, "error": repr(e)}), 500
 
+    # ===== OpenRouter: teste rápido de GET (autorização e headers) =====
     @app.get("/diag/openrouter")
     def diag_openrouter():
         try:
             import requests
+            url = "https://openrouter.ai/api/v1/models"
             headers = {
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Accept": "application/json",
             }
             if APP_PUBLIC_URL:
                 headers["HTTP-Referer"] = APP_PUBLIC_URL
                 headers["Referer"] = APP_PUBLIC_URL
             if APP_TITLE:
                 headers["X-Title"] = APP_TITLE
-            r = requests.get("https://openrouter.ai/api/v1/models", headers=headers, timeout=30)
-            body = r.json() if r.ok else r.text
-            return jsonify({"ok": r.ok, "status": r.status_code, "body": body}), (200 if r.ok else 500)
+
+            r = requests.get(url, headers=headers, timeout=30)
+            data = None
+            try:
+                data = r.json()
+            except Exception:
+                pass
+            return jsonify({
+                "ok": r.ok,
+                "status": r.status_code,
+                "models_count": (len(data.get("data", [])) if isinstance(data, dict) and "data" in data else None),
+                "headers_used": {k: headers[k] for k in headers if k in ["HTTP-Referer", "Referer", "X-Title"]},
+                "error_preview": (r.text[:500] if not r.ok else None)
+            }), (200 if r.ok else 500)
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # ===== OpenRouter: POST de chat completo (debug do 404) =====
+    @app.get("/diag/openrouter-chat")
+    def diag_openrouter_chat():
+        try:
+            import requests
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+            if APP_PUBLIC_URL:
+                headers["HTTP-Referer"] = APP_PUBLIC_URL
+                headers["Referer"] = APP_PUBLIC_URL
+            if APP_TITLE:
+                headers["X-Title"] = APP_TITLE
+
+            payload = {
+                "model": OPENROUTER_MODEL,
+                "messages": [
+                    {"role": "system", "content": "Responda em JSON com {\"ok\": true}."},
+                    {"role": "user", "content": "Ping?"}
+                ],
+                "temperature": 0.0,
+                "response_format": {"type": "json_object"}
+            }
+
+            r = requests.post(url, headers=headers, json=payload, timeout=45)
+            try:
+                body_json = r.json()
+            except Exception:
+                body_json = None
+
+            return jsonify({
+                "ok": r.ok,
+                "status": r.status_code,
+                "model": OPENROUTER_MODEL,
+                "headers_sent": {k: headers[k] for k in ["HTTP-Referer", "X-Title", "Referer"] if k in headers},
+                "body_json": body_json,
+                "body_text": (r.text[:800] if not body_json else None)
+            }), (200 if r.ok else 500)
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
 
