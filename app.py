@@ -1,4 +1,4 @@
-# app.py - Versão 6 (com diagnósticos IMAP, SSL/STARTTLS e rotas extras)
+# app.py - Versão 6.1 (Render + OpenRouter + IMAP PEEK + diagnósticos)
 import os
 import ssl
 import time
@@ -13,7 +13,6 @@ from email.parser import BytesParser
 from email.message import EmailMessage
 from markdown import markdown
 from dotenv import load_dotenv
-from pathlib import Path
 
 from flask import Flask, jsonify
 from threading import Thread
@@ -22,8 +21,17 @@ from threading import Thread
 try:
     from prompts import SYSTEM_PROMPT, USER_TEMPLATE
 except Exception:
-    SYSTEM_PROMPT = ""
-    USER_TEMPLATE = "De: {from_addr}\nAssunto: {subject}\nTexto:\n{plain_text}\nCódigo:\n{code_block}"
+    SYSTEM_PROMPT = (
+        "Você é um assistente de suporte de um curso de COBOL. "
+        "Gere respostas úteis, educadas, e diretas; se houver código, aponte erros específicos. "
+        "Retorne um JSON com as chaves: assunto, corpo_markdown, nivel_confianca (0..1), acao ('responder'|'escalar')."
+    )
+    USER_TEMPLATE = (
+        "De: {from_addr}\nAssunto: {subject}\n"
+        "Texto:\n{plain_text}\n\nCódigo:\n{code_block}\n"
+        "Responda em PT-BR. Se o pedido for claro, 'acao'='responder' com nivel_confianca>=0.8.\n"
+        "Se estiver ambíguo/faltando anexos, 'acao'='escalar' com nivel_confianca<=0.6."
+    )
 
 # LLM local via Ollama (se indisponível no Render, app segue com fallback)
 try:
@@ -48,8 +56,14 @@ SMTP_TLS_MODE = os.getenv("SMTP_TLS_MODE", "starttls").lower()  # starttls|ssl
 SMTP_DEBUG_ON = os.getenv("SMTP_DEBUG", "0") == "1"
 SENT_FOLDER = os.getenv("SENT_FOLDER", "INBOX.Sent")  # tentaremos normalizar
 
-# -------- LLM (opcional) --------
-LLM_BACKEND = os.getenv("LLM_BACKEND", "ollama")
+# -------- LLM (OpenRouter / Ollama) --------
+LLM_BACKEND = os.getenv("LLM_BACKEND", "openrouter").lower()  # openrouter|ollama
+# OpenRouter
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
+OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "COBOL Support Agent")
+# Ollama (apenas se rodar fora do Render)
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 
@@ -231,6 +245,7 @@ def move_message(imap, num, dest_folder):
     1) tenta COPY por número sequencial
     2) tenta UID COPY (pega UID antes)
     3) marca como \\Deleted (expurge ao final do ciclo se EXPUNGE_AFTER_COPY)
+    (Como usamos BODY.PEEK[], a mensagem permanece UNSEEN ao mover)
     """
     existing = _list_mailboxes_once(imap)
     candidates = [dest_folder]
@@ -386,48 +401,9 @@ def send_reply(original_msg, to_addr, reply_subject, body_markdown):
     except Exception as e:
         log("warn", "Não foi possível salvar cópia em Enviados:", e)
 
-# ========= IA =========
-""" def call_agent_local(from_addr, subject, plain_text, code_block):
-    user_prompt = USER_TEMPLATE.format(
-        from_addr=from_addr, subject=subject,
-        plain_text=plain_text[:8000], code_block=code_block[:8000]
-    )
-    if LLM_BACKEND == "ollama" and OllamaClient is not None:
-        try:
-            client = OllamaClient(OLLAMA_HOST, OLLAMA_MODEL)
-            data = client.generate_json(SYSTEM_PROMPT, user_prompt)
-            return {
-                "assunto": data.get("assunto", f"Re: {subject[:200]}"),
-                "corpo_markdown": data.get("corpo_markdown", "Obrigado pelo contato!"),
-                "nivel_confianca": float(data.get("nivel_confianca", 0.0)),
-                "acao": data.get("acao", "escalar")
-            }
-        except Exception as e:
-            log("warn", "Falha no Ollama:", e)
-
-    # fallback custo zero (sem IA remota)
-    body = (
-        "- Obrigado por enviar seu código/erro.\n"
-        "- Verifique divisões (IDENTIFICATION/DATA/PROCEDURE), níveis e PIC.\n"
-        "- Para I/O, confirme OPEN/READ/WRITE/CLOSE e status codes.\n"
-        "- Se puder, anexe seu .COB/.CBL para revisão pontual.\n"
-    )
-    return {
-        "assunto": f"Re: {subject[:200]}",
-        "corpo_markdown": body,
-        "nivel_confianca": 0.5,
-        "acao": "escalar"
-    }
-"""
-
 # ========= IA (OpenRouter / Ollama / Fallback) =========
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
-OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
-OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "COBOL Support Agent")
-
 def _ask_openrouter(system_prompt: str, user_prompt: str):
-    import requests, json
+    import requests
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -441,11 +417,11 @@ def _ask_openrouter(system_prompt: str, user_prompt: str):
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": [
-            {"role":"system", "content": SYSTEM_PROMPT},
-            {"role":"user", "content": user_prompt}
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
         ],
         "temperature": 0.2,
-        "response_format": {"type":"json_object"}
+        "response_format": {"type": "json_object"}
     }
     r = requests.post(url, json=payload, timeout=60)
     if r.status_code in (402, 429):
@@ -461,8 +437,8 @@ def call_agent_local(from_addr, subject, plain_text, code_block):
         plain_text=plain_text[:8000], code_block=code_block[:8000]
     )
 
-    # 1) OpenRouter
-    if os.getenv("LLM_BACKEND","").lower() == "openrouter" and OPENROUTER_API_KEY:
+    # 1) OpenRouter (Render-friendly; tem tier grátis)
+    if LLM_BACKEND == "openrouter" and OPENROUTER_API_KEY:
         try:
             data = _ask_openrouter(SYSTEM_PROMPT, user_prompt)
             return {
@@ -474,7 +450,7 @@ def call_agent_local(from_addr, subject, plain_text, code_block):
         except Exception as e:
             log("warn", "Falha no OpenRouter:", e)
 
-    # 2) Ollama local (se algum dia rodar em outra infra)
+    # 2) Ollama local (para rodar no seu PC/servidor com Ollama)
     if LLM_BACKEND == "ollama" and OllamaClient is not None:
         try:
             client = OllamaClient(OLLAMA_HOST, OLLAMA_MODEL)
@@ -502,8 +478,6 @@ def call_agent_local(from_addr, subject, plain_text, code_block):
         "acao": "escalar"
     }
 
-
-
 # ========= Loop principal =========
 def main_loop():
     require_env()
@@ -517,8 +491,9 @@ def main_loop():
             ids = fetch_unseen(imap)
             log("debug", f"UNSEEN: {ids}")
             for num in ids:
+                # >>> NÃO marca como lido: mantém UNSEEN ao mover <<<
                 typ, data = imap.fetch(num, '(BODY.PEEK[])')
-                if typ != "OK":
+                if typ != "OK" or not data or not data[0]:
                     continue
                 raw = data[0][1]
                 msg, msgid, from_addr, subject, plain_text, code_block = parse_message(raw)
@@ -576,7 +551,7 @@ def create_http_app():
 
     @app.get("/")
     def index():
-        return "COBOL Support Agent v6 - online", 200
+        return "COBOL Support Agent v6.1 - online", 200
 
     @app.get("/health")
     def health():
@@ -589,9 +564,11 @@ def create_http_app():
             "imap_port": IMAP_PORT,
             "imap_tls_mode": IMAP_TLS_MODE,
             "smtp_host": SMTP_HOST,
+            "smtp_port": SMTP_PORT,
             "smtp_mode": SMTP_TLS_MODE,
-            "model": OLLAMA_MODEL,
             "backend": LLM_BACKEND,
+            "model_openrouter": OPENROUTER_MODEL,
+            "model_ollama": OLLAMA_MODEL,
             "processed_folder": FOLDER_PROCESSED,
             "escalate_folder": FOLDER_ESCALATE
         }), 200
@@ -605,10 +582,6 @@ def create_http_app():
     # ===== novas rotas de diagnóstico =====
     @app.get("/diag/env")
     def diag_env():
-        def mask(s):
-            if not s:
-                return ""
-            return s[:2] + "***" + s[-2:]
         return jsonify({
             "imap_host": IMAP_HOST,
             "imap_port": IMAP_PORT,
@@ -619,6 +592,8 @@ def create_http_app():
             "smtp_host": SMTP_HOST,
             "smtp_port": SMTP_PORT,
             "smtp_tls_mode": SMTP_TLS_MODE,
+            "llm_backend": LLM_BACKEND,
+            "openrouter_model": OPENROUTER_MODEL if OPENROUTER_API_KEY else "(sem chave)",
         }), 200
 
     @app.get("/diag/imap-auth")
