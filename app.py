@@ -96,7 +96,6 @@ SIGNATURE_LINKS = os.getenv("SIGNATURE_LINKS", "")
 
 DB_PATH = "state.db"
 
-Andre Richest Costa, [8/10/2025 1:36 AM]
 # ========= Utils =========
 def log(level, *args):
     levels = {"debug": 0, "info": 1, "warn": 2, "error": 3}
@@ -211,7 +210,6 @@ def guess_first_name(from_addr: str) -> str:
         return ""
     return name
 
-Andre Richest Costa, [8/10/2025 1:36 AM]
 # ========= LIST/parse helpers =========
 def _parse_list_line(line: str):
     """
@@ -321,7 +319,6 @@ def move_message(imap, num, dest_folder):
     log("warn", f"Falha ao mover para {dest_folder}. Último erro: {last_err}")
     return False
 
-Andre Richest Costa, [8/10/2025 1:36 AM]
 # ========= SMTP envio =========
 def smtp_send(message: EmailMessage):
     if SMTP_TLS_MODE == "ssl":
@@ -421,7 +418,6 @@ def _ask_openrouter(system_prompt: str, user_prompt: str):
     import requests
     url = "https://openrouter.ai/api/v1/chat/completions"
 
-Andre Richest Costa, [8/10/2025 1:36 AM]
 headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -525,7 +521,6 @@ def main_loop():
                 if already_processed(msgid):
                     continue
 
-Andre Richest Costa, [8/10/2025 1:36 AM]
 ai = call_agent_local(from_addr, subject, plain_text, code_block)
                 action = ai.get("acao", "escalar")
                 confidence = float(ai.get("nivel_confianca", 0.0))
@@ -633,7 +628,6 @@ def create_http_app():
         except Exception as e:
             return jsonify({"ok": False, "error": repr(e)}), 500
 
-Andre Richest Costa, [8/10/2025 1:36 AM]
 @app.get("/diag/openrouter")
     def diag_openrouter_headers():
         # Apenas ecoa o que enviaríamos
