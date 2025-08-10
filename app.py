@@ -1,4 +1,4 @@
-# app.py - Versão 6.1 (Render + OpenRouter + IMAP PEEK + diagnósticos)
+# app.py - Versão 6.2 (Render + OpenRouter headers + IMAP PEEK + diagnósticos)
 import os
 import ssl
 import time
@@ -58,11 +58,14 @@ SENT_FOLDER = os.getenv("SENT_FOLDER", "INBOX.Sent")  # tentaremos normalizar
 
 # -------- LLM (OpenRouter / Ollama) --------
 LLM_BACKEND = os.getenv("LLM_BACKEND", "openrouter").lower()  # openrouter|ollama
+
 # OpenRouter
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
-OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
-OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "COBOL Support Agent")
+# novos nomes (recomendados) com fallback para os antigos:
+APP_PUBLIC_URL = os.getenv("APP_PUBLIC_URL", os.getenv("OPENROUTER_SITE_URL", ""))  # Referer
+APP_TITLE = os.getenv("APP_TITLE", os.getenv("OPENROUTER_APP_NAME", "COBOL Support Agent"))
+
 # Ollama (apenas se rodar fora do Render)
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
@@ -79,7 +82,9 @@ PORT = int(os.getenv("PORT", "10000"))
 # -------- Assinatura --------
 SIGNATURE_NAME = os.getenv("SIGNATURE_NAME", "Equipe Aprenda COBOL — Suporte")
 SIGNATURE_FOOTER = os.getenv(
-    "SIGNATURE_FOOTER", "Se precisar, responda este e-mail com mais detalhes ou anexe seu arquivo .COB/.CBL.\nHorário de atendimento: 9h–18h (ET), seg–sex.")
+    "SIGNATURE_FOOTER",
+    "Se precisar, responda este e-mail com mais detalhes ou anexe seu arquivo .COB/.CBL.\nHorário de atendimento: 9h–18h (ET), seg–sex."
+)
 SIGNATURE_LINKS = os.getenv("SIGNATURE_LINKS", "")
 
 DB_PATH = "state.db"
@@ -405,14 +410,17 @@ def send_reply(original_msg, to_addr, reply_subject, body_markdown):
 def _ask_openrouter(system_prompt: str, user_prompt: str):
     import requests
     url = "https://openrouter.ai/api/v1/chat/completions"
+
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
-    if OPENROUTER_SITE_URL:
-        headers["HTTP-Referer"] = OPENROUTER_SITE_URL
-    if OPENROUTER_APP_NAME:
-        headers["X-Title"] = OPENROUTER_APP_NAME
+    # boas práticas do OpenRouter
+    if APP_PUBLIC_URL:
+        headers["HTTP-Referer"] = APP_PUBLIC_URL
+        headers["Referer"] = APP_PUBLIC_URL  # extra: alguns proxies só passam este
+    if APP_TITLE:
+        headers["X-Title"] = APP_TITLE
 
     payload = {
         "model": OPENROUTER_MODEL,
@@ -423,7 +431,8 @@ def _ask_openrouter(system_prompt: str, user_prompt: str):
         "temperature": 0.2,
         "response_format": {"type": "json_object"}
     }
-    r = requests.post(url, json=payload, timeout=60)
+    # >>> Envia os HEADERS! <<<
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
     if r.status_code in (402, 429):
         raise RuntimeError(f"OpenRouter limit: {r.status_code} {r.text[:200]}")
     r.raise_for_status()
@@ -551,7 +560,7 @@ def create_http_app():
 
     @app.get("/")
     def index():
-        return "COBOL Support Agent v6.1 - online", 200
+        return "COBOL Support Agent v6.2 - online", 200
 
     @app.get("/health")
     def health():
@@ -594,6 +603,8 @@ def create_http_app():
             "smtp_tls_mode": SMTP_TLS_MODE,
             "llm_backend": LLM_BACKEND,
             "openrouter_model": OPENROUTER_MODEL if OPENROUTER_API_KEY else "(sem chave)",
+            "app_public_url": APP_PUBLIC_URL,
+            "app_title": APP_TITLE,
         }), 200
 
     @app.get("/diag/imap-auth")
@@ -604,6 +615,24 @@ def create_http_app():
             return jsonify({"ok": True, "msg": "LOGIN OK"}), 200
         except Exception as e:
             return jsonify({"ok": False, "error": repr(e)}), 500
+
+    @app.get("/diag/openrouter")
+    def diag_openrouter():
+        try:
+            import requests
+            headers = {
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            }
+            if APP_PUBLIC_URL:
+                headers["HTTP-Referer"] = APP_PUBLIC_URL
+                headers["Referer"] = APP_PUBLIC_URL
+            if APP_TITLE:
+                headers["X-Title"] = APP_TITLE
+            r = requests.get("https://openrouter.ai/api/v1/models", headers=headers, timeout=30)
+            body = r.json() if r.ok else r.text
+            return jsonify({"ok": r.ok, "status": r.status_code, "body": body}), (200 if r.ok else 500)
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
 
     return app
 
