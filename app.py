@@ -10,85 +10,84 @@ COBOL Support Agent — IMAP watcher + SMTP sender + OpenRouter
 
 Requisitos: apenas libs padrão + requests (Render já tem).
 """
-# app.py
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
 import re
 import ssl
 import json
 import time
-import smtplib
+import queue
+import email
 import imaplib
+import smtplib
 import logging
+import traceback
 import threading
-from datetime import datetime
+import requests
 from email import policy
-from email.parser import BytesParser
 from email.message import EmailMessage
-from flask import Flask, jsonify
+from email.header import decode_header, make_header
+from email.utils import parseaddr, formataddr, formatdate
 
-# ==============================================================================
-# Logging (robusto: aceita "debug", "INFO", "20", etc.)
-# ==============================================================================
-_raw_level = os.getenv("LOG_LEVEL", "INFO")
-try:
-    LOG_LEVEL = int(_raw_level)
-except ValueError:
-    LOG_LEVEL = getattr(logging, str(_raw_level).upper(), logging.INFO)
+from flask import Flask, jsonify, Response
 
+# -----------------------------------------------------------------------------
+# Config & logging
+# -----------------------------------------------------------------------------
+def _coerce_log_level(val: str, default=logging.INFO) -> int:
+    if not val:
+        return default
+    lv = str(val).strip().upper()
+    return getattr(logging, lv, default)
+
+LOG_LEVEL = _coerce_log_level(os.getenv("LOG_LEVEL", "INFO"))
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-logger = logging.getLogger("cobol-support-agent")
+logger = logging.getLogger(__name__)
 
-# Verbose do imaplib (0..5). Deixa em 4 no Render para ver comandos.
-try:
-    imaplib.Debug = int(os.getenv("IMAP_DEBUG", "4"))
-except Exception:
-    imaplib.Debug = 0
+# Debug baixo nível do imaplib (0..5)
+IMAP_DEBUG = int(os.getenv("IMAP_DEBUG", "0") or "0")
+imaplib.Debug = IMAP_DEBUG
 
-# ==============================================================================
-# Config / ENV helpers
-# ==============================================================================
-def env(name: str, default: str | None = None) -> str | None:
-    v = os.getenv(name)
-    if v is None or (isinstance(v, str) and v.strip() == ""):
-        return default
-    return v
+APP_PUBLIC_URL = os.getenv("APP_PUBLIC_URL")
 
-APP_PUBLIC_URL = env("APP_PUBLIC_URL")
-PORT = int(env("PORT", "10000"))
+# E-mail (IMAP/SMTP)
+IMAP_HOST = os.getenv("IMAP_HOST", os.getenv("MAIL_IMAP_HOST", "mail.aprendacobol.com.br"))
+IMAP_PORT = int(os.getenv("IMAP_PORT", os.getenv("MAIL_IMAP_PORT", "993")))
+IMAP_SSL = (os.getenv("IMAP_SSL", "true").lower() in ("1", "true", "yes"))
 
-# IMAP / SMTP — prioriza MAIL_*, depois IMAP_*/SMTP_*
-IMAP_HOST = env("IMAP_HOST", env("MAIL_IMAP_HOST", "mail.aprendacobol.com.br"))
-IMAP_PORT = int(env("IMAP_PORT", env("MAIL_IMAP_PORT", "993")))
-IMAP_SSL = env("IMAP_SSL", env("MAIL_IMAP_SSL", "true")).lower() in ("1", "true", "yes")
+# Credenciais: preferir MAIL_*; cair para IMAP_* se necessário
+IMAP_USER = os.getenv("MAIL_USER") or os.getenv("IMAP_USER")
+IMAP_PASS = os.getenv("MAIL_PASS") or os.getenv("IMAP_PASS")
 
-SMTP_HOST = env("SMTP_HOST", env("MAIL_SMTP_HOST", IMAP_HOST))
-SMTP_PORT = int(env("SMTP_PORT", env("MAIL_SMTP_PORT", "465")))
-SMTP_SSL = env("SMTP_SSL", env("MAIL_SMTP_SSL", "true")).lower() in ("1", "true", "yes")
-
-# Credenciais (usa MAIL_* primeiro)
-IMAP_USER = env("IMAP_USER", env("MAIL_USER", env("SMTP_USER")))
-IMAP_PASS = env("IMAP_PASS", env("MAIL_PASS", env("SMTP_PASS")))
-
-FROM_EMAIL = env("FROM_EMAIL", IMAP_USER)  # remetente das respostas
+SMTP_HOST = os.getenv("SMTP_HOST", os.getenv("MAIL_SMTP_HOST", "mail.aprendacobol.com.br"))
+SMTP_PORT = int(os.getenv("SMTP_PORT", os.getenv("MAIL_SMTP_PORT", "587")))
+SMTP_SSL = (os.getenv("SMTP_SSL", "false").lower() in ("1", "true", "yes"))
+SMTP_STARTTLS = (os.getenv("SMTP_STARTTLS", "true").lower() in ("1", "true", "yes"))
+SMTP_USER = os.getenv("SMTP_USER", IMAP_USER)
+SMTP_PASS = os.getenv("SMTP_PASS", IMAP_PASS)
+MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER or "")
 
 # OpenRouter
-OPENROUTER_API_KEY = env("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = env("OPENROUTER_MODEL", "openrouter/auto")
-OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_REFERRER = APP_PUBLIC_URL or "https://render.com"
-OPENROUTER_TITLE = "COBOL Support Agent"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/auto")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Watcher
-POLL_INTERVAL_SEC = int(env("POLL_INTERVAL_SEC", "60"))
-MOVE_ESCALAR_FOLDER = env("FOLDER_ESCALAR", "INBOX.Escalar")
-MOVE_RESPONDIDOS_FOLDER = env("FOLDER_RESPONDIDOS", "INBOX.Respondidos")
+# Loop
+POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "60"))
 
-# ==============================================================================
-# System prompt (versão solicitada)
-# ==============================================================================
+# Pastas
+FOLDER_ESCALAR = os.getenv("FOLDER_ESCALAR", "INBOX.Escalar")
+FOLDER_RESPONDIDOS = os.getenv("FOLDER_RESPONDIDOS", "INBOX.Respondidos")
+
+# -----------------------------------------------------------------------------
+# System prompt solicitado
+# -----------------------------------------------------------------------------
 SYSTEM_PROMPT = (
     "Você é um assistente de suporte de um curso de COBOL. "
     "SEMPRE produza um JSON VÁLIDO e nada além disso. "
@@ -105,204 +104,229 @@ SYSTEM_PROMPT = (
     "Analise o e-mail (texto e código anexo ou no corpo do e-mail). Responda educadamente. "
     "Cite pontos do COBOL (DIVISION, SECTION, PIC, níveis, I/O, SQLCA etc.). "
     "Sugira passos práticos. Se no e-mail tiver qualquer solicitação para entrar no grupo do Telegram, dê o link 'https://t.me/aprendacobol'. "
-    "Sempre ofereça o curso de Formação Completa de Programador Aprenda COBOL disponível por assinatura em: https://assinatura.aprendacobol.com.br."
+    "Sempre ofereça o curso de Formação Completa de Programadore Aprenda COBOl disponível por assinatura em: https://assinatura.aprendacobol.com.br. "
 )
 
-# ==============================================================================
-# Flask
-# ==============================================================================
-app = Flask(__name__)
+# -----------------------------------------------------------------------------
+# Utilitários de e-mail
+# -----------------------------------------------------------------------------
+def _decode_maybe_hdr(value: str) -> str:
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(value)))
+    except Exception:
+        return value
 
-@app.route("/")
-def home():
-    return "OK - COBOL Support Agent"
+def _extract_text_from_email(msg: email.message.Message) -> str:
+    """Extrai texto legível do e-mail (prefere text/plain; senão tenta html sem tags)."""
+    parts = []
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = (part.get_content_type() or "").lower()
+            disp = (part.get("Content-Disposition") or "").lower()
+            if ctype == "text/plain" and "attachment" not in disp:
+                try:
+                    parts.append(part.get_content().strip())
+                except Exception:
+                    try:
+                        parts.append(part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", "ignore"))
+                    except Exception:
+                        pass
+    else:
+        ctype = (msg.get_content_type() or "").lower()
+        if ctype == "text/plain":
+            try:
+                parts.append(msg.get_content().strip())
+            except Exception:
+                try:
+                    parts.append(msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8", "ignore"))
+                except Exception:
+                    pass
+        elif ctype == "text/html":
+            raw = msg.get_payload(decode=True) or b""
+            html = raw.decode(msg.get_content_charset() or "utf-8", "ignore")
+            # Remover tags simples
+            txt = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+            txt = re.sub(r"<[^>]+>", "", txt)
+            parts.append(txt.strip())
 
-@app.route("/diag/env")
-def diag_env():
-    return jsonify({
-        "APP_PUBLIC_URL": APP_PUBLIC_URL,
-        "imap": {
-            "host": IMAP_HOST,
-            "port": IMAP_PORT,
-            "ssl": IMAP_SSL,
-            "IMAP_USER_present": bool(IMAP_USER),
-            "IMAP_PASS_present": bool(IMAP_PASS),
-        },
-        "smtp": {
-            "host": SMTP_HOST,
-            "port": SMTP_PORT,
-            "ssl": SMTP_SSL,
-            "FROM_EMAIL": FROM_EMAIL,
-        },
-        "openrouter": {
-            "model": OPENROUTER_MODEL,
-            "api_key_present": bool(OPENROUTER_API_KEY),
-        },
-        "poll_interval_sec": POLL_INTERVAL_SEC,
-        "folders": {
-            "escalar": MOVE_ESCALAR_FOLDER,
-            "respondidos": MOVE_RESPONDIDOS_FOLDER,
-        },
-        "log_level": LOG_LEVEL,
-    })
+    text = ("\n\n").join([p for p in parts if p]).strip()
+    if not text:
+        text = "(sem corpo de texto)"
+    return text
 
-@app.route("/diag/openrouter-chat")
-def diag_openrouter_chat():
-    # Rota “eco” simples para checagem sem custo
-    return jsonify({"ok": True, "eco": "teste", "model": OPENROUTER_MODEL})
+def _build_reply(original: email.message.Message, assunto: str, corpo_markdown: str) -> EmailMessage:
+    from_name, from_addr = parseaddr(original.get("To") or MAIL_FROM)
+    orig_from_name, orig_from_addr = parseaddr(original.get("From") or "")
+    reply = EmailMessage()
+    reply["From"] = MAIL_FROM
+    reply["To"] = formataddr((orig_from_name, orig_from_addr))
+    # Assunto com Re: se necessário
+    if not assunto:
+        assunto = _decode_maybe_hdr(original.get("Subject") or "")
+    if not assunto.lower().startswith("re:"):
+        assunto = f"Re: {assunto}"
+    reply["Subject"] = assunto
+    # Threading headers
+    if original.get("Message-ID"):
+        reply["In-Reply-To"] = original["Message-ID"]
+        refs = original.get("References")
+        reply["References"] = f"{refs} {original['Message-ID']}" if refs else original["Message-ID"]
+    reply["Date"] = formatdate(localtime=True)
+    reply.set_content(corpo_markdown or "(sem corpo)", subtype="plain", charset="utf-8")
+    return reply
 
-# ==============================================================================
-# Helpers — IMAP / SMTP
-# ==============================================================================
+def smtp_send(msg: EmailMessage):
+    if not SMTP_HOST or not SMTP_PORT or not SMTP_USER or not SMTP_PASS or not MAIL_FROM:
+        raise RuntimeError("Config SMTP incompleta.")
+    logger.info("Enviando resposta SMTP para %s ...", msg["To"])
+    if SMTP_SSL:
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx, timeout=60) as s:
+            s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as s:
+            if SMTP_STARTTLS:
+                s.starttls(context=ssl.create_default_context())
+            s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
+    logger.info("Resposta enviada com sucesso.")
+
+# -----------------------------------------------------------------------------
+# IMAP helpers (AUTH=PLAIN preferencial)
+# -----------------------------------------------------------------------------
 def imap_connect() -> imaplib.IMAP4:
     if not IMAP_USER or not IMAP_PASS:
-        raise RuntimeError("Variáveis ausentes: IMAP_USER/IMAP_PASS (ou MAIL_USER/MAIL_PASS).")
+        raise RuntimeError("Variáveis ausentes: MAIL_USER/MAIL_PASS (ou IMAP_USER/IMAP_PASS).")
 
     if IMAP_SSL:
-        imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+        ctx = ssl.create_default_context()
+        imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ctx)
     else:
         imap = imaplib.IMAP4(IMAP_HOST, IMAP_PORT)
         imap.starttls()
 
-    # imaplib.Debug cuidará de logar o LOGIN; aqui só fazemos o login
-    imap.login(IMAP_USER, IMAP_PASS)
+    # Capabilities (pré-login)
+    try:
+        typ, caps = imap.capability()
+        caps_joined = " ".join(
+            c.decode("utf-8", "ignore") if isinstance(c, bytes) else str(c) for c in (caps or [])
+        )
+        logger.debug("CAPABILITIES: %s", caps_joined)
+    except Exception:
+        pass
+
+    # Tenta AUTH=PLAIN, fallback para LOGIN, com retry
+    try:
+        # após login o servidor divulga mais capabilities, mas já dá pra tentar AUTH=PLAIN
+        try:
+            imap.authenticate("PLAIN", lambda _: f"\0{IMAP_USER}\0{IMAP_PASS}".encode("utf-8"))
+        except Exception as auth_err:
+            logger.warning("AUTH=PLAIN falhou (%s). Tentando LOGIN ...", auth_err)
+            imap.login(IMAP_USER, IMAP_PASS)
+    except imaplib.IMAP4.error as e:
+        logger.warning("Autenticação falhou: %s. Retentando em 2s ...", e)
+        time.sleep(2.0)
+        imap.login(IMAP_USER, IMAP_PASS)
+
     return imap
 
-def smtp_connect() -> smtplib.SMTP:
-    if SMTP_SSL or SMTP_PORT == 465:
-        context = ssl.create_default_context()
-        server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context)
-    else:
-        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
-        server.starttls()
-    server.login(IMAP_USER, IMAP_PASS)  # usa as mesmas credenciais
-    return server
+def ensure_mailbox(imap: imaplib.IMAP4, mailbox: str):
+    try:
+        typ, data = imap.list('""', '*')
+        names = []
+        if typ == "OK" and data:
+            for raw in data:
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", "ignore")
+                # nome é o último token entre aspas ou após o separador
+                parts = line.split(' "." ')
+                if len(parts) == 2:
+                    names.append(parts[1].strip().strip('"'))
+        if mailbox in names:
+            return
+        imap.create(mailbox)
+    except Exception as e:
+        # se já existe, ignorar
+        if "ALREADYEXISTS" not in str(e).upper():
+            logger.debug("ensure_mailbox('%s') aviso: %s", mailbox, e)
 
-def ensure_mailbox(imap: imaplib.IMAP4, mbox: str):
-    typ, data = imap.list()
+def move_message(imap: imaplib.IMAP4, seq_num: str, dest_mailbox: str):
+    ensure_mailbox(imap, dest_mailbox)
+    typ, _ = imap.copy(seq_num, dest_mailbox)
     if typ != "OK":
-        logger.warning("LIST falhou ao verificar caixas.")
-        return
-    names = []
-    if data:
-        for raw in data:
-            # raw é bytes, ex: b'(\\HasNoChildren) "." INBOX.Escalar'
-            s = raw.decode("utf-8", errors="ignore")
-            parts = s.split(" ")
-            if parts:
-                name = s.split(' "." ')[-1].strip().strip('"')
-                names.append(name)
-    if mbox not in names:
-        typ, _ = imap.create(mbox)
-        if typ != "OK":
-            logger.warning("CREATE %s falhou ou já existe.", mbox)
-
-def move_message(imap: imaplib.IMAP4, msg_seq: bytes, dest_folder: str):
-    ensure_mailbox(imap, dest_folder)
-    typ, _ = imap.copy(msg_seq, dest_folder)
-    if typ != "OK":
-        logger.error("COPY falhou para %s -> %s", msg_seq, dest_folder)
-        return
-    imap.store(msg_seq, "+FLAGS", r"(\Deleted)")
+        raise RuntimeError(f"Falha no COPY para {dest_mailbox}")
+    imap.store(seq_num, "+FLAGS", r"(\Deleted)")
     imap.expunge()
 
-# ==============================================================================
-# Extração de texto do e-mail
-# ==============================================================================
-def extract_text_from_email(msg) -> str:
-    if msg.is_multipart():
-        parts = []
-        for part in msg.walk():
-            ctype = part.get_content_type()
-            disp = part.get_content_disposition()
-            if ctype == "text/plain" and disp != "attachment":
-                try:
-                    parts.append(part.get_content())
-                except Exception:
-                    payload = part.get_payload(decode=True)
-                    if payload:
-                        parts.append(payload.decode("utf-8", errors="ignore"))
-        if parts:
-            return "\n\n".join(parts)
-    # fallback
-    try:
-        return msg.get_content()
-    except Exception:
-        payload = msg.get_payload(decode=True)
-        if payload:
-            return payload.decode("utf-8", errors="ignore")
-    return ""
-
-# ==============================================================================
-# OpenRouter — chamada e parsing
-# ==============================================================================
-def call_openrouter(messages, max_tokens=700, temperature=0.2) -> str:
+# -----------------------------------------------------------------------------
+# OpenRouter: chamada + parser robusto
+# -----------------------------------------------------------------------------
+def call_openrouter(email_subject: str, email_from: str, email_text: str) -> str:
     """
-    Retorna o texto bruto do modelo (pode vir com lixo). Não levanta exceção
-    por status HTTP != 200, devolve string vazia nesses casos.
+    Retorna o texto bruto do modelo (pode vir com lixo, por isso existe parse abaixo).
     """
     if not OPENROUTER_API_KEY:
-        logger.warning("OPENROUTER_API_KEY ausente; retornando string vazia.")
-        return ""
+        # Sem API key: devolve stub que força escalar (para ambiente de teste)
+        return '{"assunto":"","corpo_markdown":"","nivel_confianca":0.5,"acao":"escalar"}'
 
-    import urllib.request
-    import urllib.error
+    user_prompt = (
+        "Dados do e-mail a analisar (não responda aqui; siga o formato do JSON pedido no system):\n"
+        f"Assunto: {email_subject}\n"
+        f"De: {email_from}\n"
+        "Corpo:\n"
+        f"{email_text}\n"
+    )
 
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": APP_PUBLIC_URL or "https://cobol-support-agent-cloud-hostgator.onrender.com",
+        "X-Title": "COBOL Support Agent",
+    }
     payload = {
         "model": OPENROUTER_MODEL,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        # Ajuda alguns modelos a priorizarem JSON:
-        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": 700,
+        "temperature": 0.2,
     }
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        OPENROUTER_ENDPOINT,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "HTTP-Referer": OPENROUTER_REFERRER,
-            "X-Title": OPENROUTER_TITLE,
-        },
-        method="POST",
-    )
+
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            body = resp.read()
-            try:
-                obj = json.loads(body.decode("utf-8", errors="ignore"))
-            except Exception:
-                logger.warning("OpenRouter retornou corpo não-JSON.")
-                return body.decode("utf-8", errors="ignore")
-            # padrão OpenRouter
-            if isinstance(obj, dict) and "choices" in obj and obj["choices"]:
-                return obj["choices"][0]["message"].get("content", "")
-            # fallback: retorna o bruto
-            return body.decode("utf-8", errors="ignore")
-    except urllib.error.HTTPError as e:
-        logger.warning("OpenRouter HTTPError %s: %s", e.code, e.read().decode("utf-8", errors="ignore"))
-        return ""
+        resp = requests.post(OPENROUTER_URL, headers=headers, data=json.dumps(payload), timeout=60)
+        resp.raise_for_status()
+        j = resp.json()
+        content = j["choices"][0]["message"]["content"]
+        return content
     except Exception as e:
-        logger.warning("OpenRouter erro: %s", e)
-        return ""
+        logger.warning("Falha no OpenRouter: %s", e)
+        return ""  # vai cair no fallback de escalar
 
-def _strip_code_fences(text: str) -> str:
-    # remove ```json ... ``` e ``` ... ```
-    return re.sub(r"```[\s\S]*?```", "", text or "", flags=re.DOTALL)
+def extract_first_json_object(text: str) -> dict:
+    """
+    Extrai o primeiro objeto JSON válido do texto, respeitando aspas e escapes.
+    Levanta ValueError se não encontrar.
+    """
+    if not text:
+        raise ValueError("vazio")
+    # Retira eventuais cercas de código
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.strip("`").strip()
+        # muitas vezes vem "json\n{...}"
+        if t.lower().startswith("json"):
+            t = t[4:].lstrip()
 
-def _find_first_balanced_json(text: str) -> str | None:
-    """
-    Varre o texto e retorna o primeiro trecho com chaves balanceadas
-    respeitando aspas e escapes. None se não achar.
-    """
-    s = text
     in_str = False
     esc = False
     depth = 0
     start = -1
-    for i, ch in enumerate(s):
+    for i, ch in enumerate(t):
         if in_str:
             if esc:
                 esc = False
@@ -319,192 +343,114 @@ def _find_first_balanced_json(text: str) -> str | None:
                 if depth == 0:
                     start = i
                 depth += 1
-            elif ch == "}":
-                if depth > 0:
-                    depth -= 1
-                    if depth == 0 and start != -1:
-                        return s[start:i+1]
-    return None
+                continue
+            if ch == "}":
+                depth -= 1
+                if depth == 0 and start != -1:
+                    candidate = t[start : i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except Exception as je:
+                        # continua procurando o próximo bloco
+                        pass
+    raise ValueError("nenhum JSON válido encontrado")
 
-def parse_model_json(raw_text: str) -> dict | None:
+def normalize_model_output(raw_text: str) -> dict:
     """
-    Tenta extrair um JSON válido com o esquema exigido.
-    Retorna dict ou None.
+    Converte a saída do modelo em dict com chaves esperadas.
+    Se falhar, levanta ValueError.
     """
-    if not raw_text:
-        return None
-
-    # 1) remove cercas de código
-    cleaned = _strip_code_fences(raw_text).strip()
-
-    # 2) tentativa direta
-    if cleaned.startswith("{") and cleaned.endswith("}"):
-        try:
-            return json.loads(cleaned)
-        except Exception:
-            pass
-
-    # 3) tentar achar primeiro bloco balanceado
-    candidate = _find_first_balanced_json(cleaned)
-    if candidate:
-        try:
-            return json.loads(candidate)
-        except Exception:
-            # tenta de novo removendo possíveis BOMs/char estranhos
-            try:
-                return json.loads(candidate.encode("utf-8", "ignore").decode("utf-8"))
-            except Exception:
-                pass
-
-    # 4) heurística: pegar a MAIOR substring entre primeira "{" e última "}"
+    obj = extract_first_json_object(raw_text)
+    # valida chaves
+    for k in ("assunto", "corpo_markdown", "nivel_confianca", "acao"):
+        if k not in obj:
+            raise ValueError(f"chave ausente: {k}")
+    ac = str(obj["acao"]).strip().lower()
+    if ac not in ("responder", "escalar"):
+        raise ValueError(f"acao inválida: {ac}")
     try:
-        first = cleaned.index("{")
-        last = cleaned.rindex("}")
-        big = cleaned[first:last+1]
-        return json.loads(big)
+        obj["nivel_confianca"] = float(obj["nivel_confianca"])
     except Exception:
-        return None
+        raise ValueError("nivel_confianca inválido")
+    obj["assunto"] = str(obj.get("assunto") or "").strip()
+    obj["corpo_markdown"] = str(obj.get("corpo_markdown") or "").strip()
+    obj["acao"] = ac
+    return obj
 
-def decide_action_from_model(email_subject: str, email_from: str, email_body: str) -> dict:
-    """
-    Monta prompt, chama o modelo, aplica parser e valida o esquema.
-    Em caso de falha, retorna decisão de 'escalar'.
-    """
-    # Conteúdo para o modelo (limita tamanho para evitar custos/estouro)
-    body_trim = email_body.strip()
-    if len(body_trim) > 7000:
-        body_trim = body_trim[:7000] + "\n\n[TRUNCADO]"
-
-    user_content = (
-        "### E-mail recebido\n"
-        f"Assunto: {email_subject}\n"
-        f"Remetente: {email_from}\n\n"
-        f"Corpo:\n{body_trim}\n"
-    )
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_content},
-    ]
-
-    raw = call_openrouter(messages)
-    preview = (raw or "")[:1200]
-    if not raw:
-        logger.warning("Falha no OpenRouter: resposta vazia.")
-        return {"acao": "escalar", "nivel_confianca": 0.5, "assunto": "", "corpo_markdown": ""}
-
-    data = parse_model_json(raw)
-    if not data:
-        logger.warning("Falha ao parsear JSON do modelo: preview=%s", preview)
-        return {"acao": "escalar", "nivel_confianca": 0.5, "assunto": "", "corpo_markdown": ""}
-
-    # Normalização / validação
-    acao = str(data.get("acao", "")).lower().strip()
-    nivel = data.get("nivel_confianca")
-    assunto = str(data.get("assunto", "")).strip()
-    corpo = str(data.get("corpo_markdown", "")).strip()
-
-    if acao not in ("responder", "escalar"):
-        logger.warning("Campo 'acao' inválido: %s", acao)
-        return {"acao": "escalar", "nivel_confianca": 0.5, "assunto": "", "corpo_markdown": ""}
-
-    try:
-        nivel = float(nivel)
-    except Exception:
-        nivel = 0.0
-
-    if not (0.0 <= nivel <= 1.0):
-        nivel = 0.0
-
-    if acao == "responder":
-        # requisitos mínimos para responder
-        if nivel < 0.8 or not corpo:
-            logger.info("Modelo sugeriu responder, mas nivel/corpo insuficiente. Escalando.")
-            return {"acao": "escalar", "nivel_confianca": 0.5, "assunto": "", "corpo_markdown": ""}
-
-        if not assunto:
-            assunto = f"Re: {email_subject or ''}".strip()
-
-    return {"acao": acao, "nivel_confianca": nivel, "assunto": assunto, "corpo_markdown": corpo}
-
-# ==============================================================================
-# Resposta por e-mail
-# ==============================================================================
-def send_reply(to_addr: str, original_subject: str, reply_subject: str, body_md: str):
-    msg = EmailMessage()
-    msg["From"] = FROM_EMAIL
-    msg["To"] = to_addr
-    msg["Subject"] = reply_subject or f"Re: {original_subject}"
-
-    # Envia como texto simples; se quiser HTML, converter markdown -> HTML aqui
-    msg.set_content(body_md or "", subtype="plain", charset="utf-8")
-
-    with smtp_connect() as smtp:
-        smtp.send_message(msg)
-
-# ==============================================================================
-# Loop de processamento IMAP
-# ==============================================================================
+# -----------------------------------------------------------------------------
+# Processamento IMAP (uma passada)
+# -----------------------------------------------------------------------------
 def process_unseen_once():
     imap = None
     try:
         imap = imap_connect()
-        typ, _ = imap.select("INBOX")
+        typ, _ = imap.select("INBOX")  # READ-WRITE
         if typ != "OK":
-            logger.error("SELECT INBOX falhou.")
-            return
+            raise RuntimeError("Falha ao selecionar INBOX")
 
         typ, data = imap.search(None, "UNSEEN")
         if typ != "OK":
-            logger.error("SEARCH UNSEEN falhou.")
-            return
+            raise RuntimeError("Falha no SEARCH UNSEEN")
 
-        unseen = data[0].split() if data and data[0] else []
-        logger.debug("UNSEEN: %s", unseen)
+        ids = []
+        if data and len(data) > 0 and data[0]:
+            ids = data[0].split()
 
-        if not unseen:
-            # housekeeping: EXPUNGE limpa deletados
+        logger.debug("UNSEEN: %s", ids)
+
+        # nada a fazer
+        if not ids:
             imap.expunge()
             return
 
-        for seq in unseen:
-            # fetch corpo inteiro
-            typ, msg_data = imap.fetch(seq, "(BODY.PEEK[])")
-            if typ != "OK" or not msg_data:
-                logger.warning("FETCH falhou para %s", seq)
-                continue
+        # Processa apenas o primeiro por ciclo (evita timeouts)
+        seq = ids[0].decode() if isinstance(ids[0], bytes) else str(ids[0])
 
-            raw_email = b""
-            for part in msg_data:
-                if isinstance(part, tuple) and len(part) == 2:
-                    raw_email += part[1]
+        # Busca corpo completo
+        typ, msgdata = imap.fetch(seq, "(BODY.PEEK[])")
+        if typ != "OK" or not msgdata or not msgdata[0]:
+            raise RuntimeError("Falha no FETCH")
 
-            msg = BytesParser(policy=policy.default).parsebytes(raw_email)
-            from_addr = (msg.get("Reply-To") or msg.get("From") or "").strip()
-            subject = (msg.get("Subject") or "").strip()
-            body = extract_text_from_email(msg)
+        raw = msgdata[0][1]
+        msg = email.message_from_bytes(raw, policy=policy.default)
 
-            # Decisão via modelo (com fail-safe)
-            decision = decide_action_from_model(subject, from_addr, body)
-            acao = decision["acao"]
-            nivel = decision["nivel_confianca"]
-            assunto_resp = decision.get("assunto", "")
-            corpo_md = decision.get("corpo_markdown", "")
+        subj = _decode_maybe_hdr(msg.get("Subject") or "")
+        from_hdr = msg.get("From") or ""
+        from_name, from_addr = parseaddr(from_hdr)
+        body_txt = _extract_text_from_email(msg)
 
-            logger.info("Ação=%s conf=%.2f", acao, nivel)
+        # Chama modelo
+        raw_out = call_openrouter(subj, from_addr, body_txt)
 
-            if acao == "responder" and nivel >= 0.8 and corpo_md:
-                try:
-                    send_reply(from_addr, subject, assunto_resp, corpo_md)
-                    move_message(imap, seq, MOVE_RESPONDIDOS_FOLDER)
-                except Exception as e:
-                    logger.exception("Falha ao responder; escalando. Erro: %s", e)
-                    move_message(imap, seq, MOVE_ESCALAR_FOLDER)
-            else:
-                move_message(imap, seq, MOVE_ESCALAR_FOLDER)
+        # Tenta normalizar; em caso de falha, ESCALAR
+        try:
+            obj = normalize_model_output(raw_out)
+        except Exception as e:
+            preview = (raw_out or "")[:1200]
+            logger.warning("Falha ao parsear JSON do modelo: %s | preview=%s", e, preview)
+            obj = {"assunto": "", "corpo_markdown": "", "nivel_confianca": 0.5, "acao": "escalar"}
+
+        acao = obj["acao"]
+        conf = obj["nivel_confianca"]
+
+        logger.info("Decisão do modelo: acao=%s conf=%.2f", acao, conf)
+
+        if acao == "responder" and conf >= 0.80 and obj["corpo_markdown"]:
+            try:
+                reply = _build_reply(msg, obj["assunto"], obj["corpo_markdown"])
+                smtp_send(reply)
+                move_message(imap, seq, FOLDER_RESPONDIDOS)
+                logger.info("E-mail respondido e movido para %s", FOLDER_RESPONDIDOS)
+            except Exception as e_send:
+                logger.error("Falha ao enviar resposta (%s). Escalando ...", e_send)
+                move_message(imap, seq, FOLDER_ESCALAR)
+        else:
+            move_message(imap, seq, FOLDER_ESCALAR)
+            logger.info("E-mail movido para %s", FOLDER_ESCALAR)
 
     except Exception as e:
-        logger.exception("Erro no ciclo IMAP: %s", e)
+        logger.error("Erro no ciclo IMAP: %s", e)
+        logger.debug("Trace:\n%s", traceback.format_exc())
     finally:
         try:
             if imap is not None:
@@ -512,21 +458,85 @@ def process_unseen_once():
         except Exception:
             pass
 
-def watcher_loop():
+# -----------------------------------------------------------------------------
+# Worker loop (thread)
+# -----------------------------------------------------------------------------
+def worker_loop():
+    if APP_PUBLIC_URL:
+        logger.info("App público em: %s", APP_PUBLIC_URL)
+    else:
+        logger.info("App iniciando (APP_PUBLIC_URL não definido)")
+
+    while True:
+        t0 = time.time()
+        process_unseen_once()
+        elapsed = time.time() - t0
+        sleep_for = max(1.0, POLL_INTERVAL_SEC - elapsed)
+        time.sleep(sleep_for)
+
+# -----------------------------------------------------------------------------
+# Flask app
+# -----------------------------------------------------------------------------
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return Response("OK", mimetype="text/plain")
+
+@app.route("/health")
+def health():
+    return jsonify({"ok": True, "ts": int(time.time())})
+
+@app.route("/diag/openrouter-chat")
+def diag_openrouter():
+    # Diagnóstico simples
+    if not OPENROUTER_API_KEY:
+        # Sem API: retorna echo controlado
+        return jsonify({"body_json": {"eco": "teste", "ok": True}, "model": OPENROUTER_MODEL, "ok": True})
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": APP_PUBLIC_URL or "https://cobol-support-agent-cloud-hostgator.onrender.com",
+        "X-Title": "COBOL Support Agent",
+    }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "Teste rápido: responda apenas com o JSON minificado solicitado, acao=escalar, nivel_confianca=0.5."},
+        ],
+        "max_tokens": 60,
+        "temperature": 0.0,
+    }
+    try:
+        r = requests.post(OPENROUTER_URL, headers=headers, data=json.dumps(payload), timeout=30)
+        r.raise_for_status()
+        j = r.json()
+        content = j["choices"][0]["message"]["content"]
+        # tenta parse (apenas para validar)
+        ok = True
+        err = None
+        try:
+            _ = normalize_model_output(content)
+        except Exception as e:
+            ok = False
+            err = str(e)
+        return jsonify({"body_json": content, "ok": ok, "error": err, "model": OPENROUTER_MODEL})
+    except Exception as e:
+        return jsonify({"error": str(e), "ok": False, "model": OPENROUTER_MODEL})
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    # Inicia worker em background
+    threading.Thread(target=worker_loop, name="imap-worker", daemon=True).start()
+
+    # Sobe o Flask
+    port = int(os.getenv("PORT", "10000"))
+    host = "0.0.0.0"
     logger.info("Watcher IMAP — envio via SMTP HostGator")
     if APP_PUBLIC_URL:
         logger.info("App público em: %s", APP_PUBLIC_URL)
-    while True:
-        process_unseen_once()
-        time.sleep(POLL_INTERVAL_SEC)
-
-# ==============================================================================
-# Main
-# ==============================================================================
-if __name__ == "__main__":
-    # Sobe watcher em thread separada
-    t = threading.Thread(target=watcher_loop, daemon=True)
-    t.start()
-
-    # Flask web
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    app.run(host=host, port=port, debug=False)
