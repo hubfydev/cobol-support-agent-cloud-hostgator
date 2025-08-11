@@ -194,13 +194,23 @@ def md_to_html(md: str) -> str:
 # =========================
 
 def make_signature() -> str:
+    # Converte "\n" literal em quebras de linha reais
+    footer = (SIGNATURE_FOOTER or "").replace("\\n", "\n").strip()
+    link = (SIGNATURE_LINKS or "").strip()
+
+    # Se o footer terminar com "em:", coloca o link na MESMA linha
+    if footer and link and footer.rstrip().endswith(":"):
+        footer = footer.rstrip() + " " + link
+        link = ""  # já incorporado
+
     lines = []
-    if SIGNATURE_FOOTER:
-        lines.append(SIGNATURE_FOOTER.strip())
-    if SIGNATURE_LINKS:
-        lines.append(SIGNATURE_LINKS.strip())
+    if footer:
+        lines.append(footer)
+    if link:
+        lines.append(link)
     if SIGNATURE_NAME:
         lines.append(f"\n— {SIGNATURE_NAME}")
+
     return "\n\n" + "\n".join(lines) + "\n"
 
 def decode_str(v: Optional[str]) -> str:
