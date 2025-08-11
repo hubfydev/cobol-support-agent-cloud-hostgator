@@ -225,7 +225,7 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
         "response_format": {"type": "json_object"},  # força JSON
         "messages": [
             {"role": "system", "content": system_prompt},  # apenas 1 system
-            {"role": "user", "content": user_prompt},      # e 1 user
+            {"role": "user", "content": user_prompt},      # apenas 1 user
         ],
     }
 
@@ -245,6 +245,42 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
     except Exception:
         pass
 
+    # fallback: extrair o primeiro objeto JSON balanceando chaves
+    def _first_json_object(s: str):
+        start = s.find("{")
+        while start != -1:
+            depth = 0
+            in_str = False
+            esc = False
+            for i in range(start, len(s)):
+                ch = s[i]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                else:
+                    if ch == '"':
+                        in_str = True
+                    elif ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            candidate = s[start:i+1]
+                            try:
+                                return json.loads(candidate)
+                            except Exception:
+                                break
+            start = s.find("{", start + 1)
+        return None
+
+    obj = _first_json_object(content)
+    if obj is None:
+        raise ValueError("Resposta do LLM sem JSON reconhecível.")
+    return obj
     # fallback: extrair o primeiro objeto JSON balanceando chaves
     def _first_json_object(s: str):
         start = s.find("{")
@@ -528,7 +564,7 @@ def diag_openrouter():
             "top_p": 0,
             "response_format": {"type": "json_object"},
             "messages": [
-                {\1'Reponda somente JSON: {"ok":true}'ok\\":true}"},
+                # {\1'Responda somente JSON: {"ok":true}'ok\\":true}"},
                 {"role": "user", "content": "ping"},
             ],
         }
