@@ -69,6 +69,8 @@ APP_TITLE = os.getenv("APP_TITLE", "COBOL Support Agent")
 # Assinatura / rodapé
 SIGNATURE_NAME = os.getenv("SIGNATURE_NAME", "Equipe Aprenda COBOL — Suporte")
 SIGNATURE_FOOTER = os.getenv(
+    # logo após carregar SIGNATURE_FOOTER do os.getenv:
+    SIGNATURE_FOOTER = SIGNATURE_FOOTER.replace("\\n", "\n")
     "SIGNATURE_FOOTER",
     (
         "Se precisar, responda este e-mail com mais detalhes ou anexe seu arquivo .COB/.CBL.\n"
