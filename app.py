@@ -107,8 +107,8 @@ SIGNATURE_LINKS = os.getenv("SIGNATURE_LINKS", "https://aprendacobol.com.br/assi
 # Prompts
 # =========================
 
-SYSTEM_PROMPT_BASE = (
-#SYSTEM_PROMPT = (
+#SYSTEM_PROMPT_BASE = (
+SYSTEM_PROMPT = (
     "Você é um assistente de suporte de um curso de COBOL. "
     "SEMPRE produza um JSON VÁLIDO e nada além disso. "
     "Formato do JSON (minificado, sem comentários, sem markdown, sem texto extra): "
