@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 - v9.3
+#!/usr/bin/env python3 - v9.4 (atualizado)
 # -*- coding: utf-8 -*-
 
 """
