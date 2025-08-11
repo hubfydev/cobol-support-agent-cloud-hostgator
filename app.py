@@ -1,5 +1,5 @@
-#!/usr/bin/env python3 - v9.6 (atualizado indo para 9.7 - mais um commit)
-# -*- coding: utf-8 -*- 
+#!/usr/bin/env python3 - v9.7
+# -*- coding: utf-8 -*-
 
 """
 COBOL Support Agent — IMAP watcher + SMTP sender + OpenRouter
@@ -7,8 +7,6 @@ COBOL Support Agent — IMAP watcher + SMTP sender + OpenRouter
 - Classifica/gera ação via OpenRouter
 - Responde por SMTP OU move para INBOX.Escalar/INBOX.Respondidos
 - Exibe rotas / e /diag/* para health-check
-
-Requisitos: apenas libs padrão + requests (Render já tem).
 """
 
 import os
@@ -16,17 +14,15 @@ import re
 import ssl
 import time
 import json
-import hmac
 import hashlib
 import logging
 import imaplib
 import smtplib
-from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
 from email.message import EmailMessage
 from email.header import decode_header, make_header
-from email.utils import formatdate, make_msgid, parsedate_to_datetime
+from email.utils import formatdate
 
 from flask import Flask, jsonify
 
@@ -119,11 +115,9 @@ log.info("SYSTEM_PROMPT_SHA1=%s (primeiros 120 chars): %s", SYSTEM_PROMPT_SHA1[:
 # ==========================
 
 def _safe_box(name: str) -> str:
-    # se já vier com INBOX. mantemos; caso contrário, prefixamos.
     if name.upper().startswith("INBOX"):
         return name
     return f"INBOX.{name}"
-
 
 def decode_mime_words(s):
     if not s:
@@ -132,7 +126,6 @@ def decode_mime_words(s):
         return str(make_header(decode_header(s)))
     except Exception:
         return s
-
 
 def extract_text_body(msg):
     # Prioriza text/plain; se não houver, converte text/html para texto
@@ -171,14 +164,12 @@ def extract_text_body(msg):
     # fallback simples de HTML->texto
     if html_parts:
         html = "\n\n".join(html_parts)
-        # remove tags básicas
         text = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
         text = re.sub(r"</p>", "\n\n", text, flags=re.I)
         text = re.sub(r"<[^>]+>", "", text)
         return re.sub(r"\n{3,}", "\n\n", text).strip()
 
     return ""
-
 
 def extract_cobol_attachments(msg, max_bytes=80_000):
     cobol_files = []
@@ -202,7 +193,6 @@ def extract_cobol_attachments(msg, max_bytes=80_000):
                         continue
     return cobol_files
 
-
 # ==========================
 # OpenRouter client
 # ==========================
@@ -224,8 +214,8 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
         "top_p": 0,
         "response_format": {"type": "json_object"},  # força JSON
         "messages": [
-            {"role": "system", "content": system_prompt},  # apenas 1 system
-            {"role": "user", "content": user_prompt},      # apenas 1 user
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ],
     }
 
@@ -281,47 +271,10 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
     if obj is None:
         raise ValueError("Resposta do LLM sem JSON reconhecível.")
     return obj
-    # fallback: extrair o primeiro objeto JSON balanceando chaves
-    def _first_json_object(s: str):
-        start = s.find("{")
-        while start != -1:
-            depth = 0
-            in_str = False
-            esc = False
-            for i in range(start, len(s)):
-                ch = s[i]
-                if in_str:
-                    if esc:
-                        esc = False
-                    elif ch == "\\":
-                        esc = True
-                    elif ch == '"':
-                        in_str = False
-                else:
-                    if ch == '"':
-                        in_str = True
-                    elif ch == "{":
-                        depth += 1
-                    elif ch == "}":
-                        depth -= 1
-                        if depth == 0:
-                            candidate = s[start:i+1]
-                            try:
-                                return json.loads(candidate)
-                            except Exception:
-                                break
-            start = s.find("{", start + 1)
-        return None
-
-    obj = _first_json_object(content)
-    if obj is None:
-        raise ValueError("Resposta do LLM sem JSON reconhecível.")
-    return obj
 
 # ==========================
 # Fluxo principal
 # ==========================
-
 def ensure_reply_prefix(subject: str) -> str:
     if not subject:
         return "Re:"
@@ -330,9 +283,7 @@ def ensure_reply_prefix(subject: str) -> str:
         return s
     return f"Re: {s}"
 
-
 def build_user_prompt(original_subject: str, body_text: str, cobol_files: list) -> str:
-    # Monta o prompt para o modelo
     parts = []
     parts.append(f"Assunto original: {original_subject}")
     parts.append("\nCorpo do e-mail do aluno:\n" + (body_text or "(vazio)"))
@@ -350,17 +301,19 @@ def build_user_prompt(original_subject: str, body_text: str, cobol_files: list) 
 
     return "\n".join(parts)
 
-
 def build_outgoing_body(corpo_markdown: str) -> str:
-    # adiciona assinatura institucional; não mexe nas URLs (texto puro)
-    lines = [corpo_markdown.strip(), "", SIGNATURE_FOOTER.strip(), SIGNATURE_LINKS.strip(), "", f"— {SIGNATURE_NAME.strip()} "]
-    # normaliza quebras
+    lines = [
+        corpo_markdown.strip(),
+        "",
+        SIGNATURE_FOOTER.strip(),
+        SIGNATURE_LINKS.strip(),
+        "",
+        f"— {SIGNATURE_NAME.strip()} ",
+    ]
     out = "\n".join(lines)
     out = out.replace("\r\n", "\n").replace("\r", "\n")
-    # elimina \n extras consecutivos
     out = re.sub(r"\n{3,}", "\n\n", out)
     return out
-
 
 def send_email_reply(original_msg, to_addr: str, subject: str, body_text: str) -> bytes:
     msg = EmailMessage()
@@ -395,17 +348,13 @@ def send_email_reply(original_msg, to_addr: str, subject: str, body_text: str) -
             s.login(MAIL_USER, MAIL_PASS)
             s.send_message(msg)
 
-    # retorna bytes crus para APPEND no Sent
     return msg.as_bytes()
-
 
 def ensure_mailbox(imap: imaplib.IMAP4_SSL, box: str):
     try:
         imap.create(box)
     except Exception:
-        # alguns servidores retornam NO [ALREADYEXISTS]
         log.debug("Mailbox pode já existir: %s", box)
-
 
 def move_message(imap: imaplib.IMAP4_SSL, msg_seq: bytes, dest_box: str):
     ensure_mailbox(imap, dest_box)
@@ -414,17 +363,13 @@ def move_message(imap: imaplib.IMAP4_SSL, msg_seq: bytes, dest_box: str):
         imap.store(msg_seq, "+FLAGS", r"(\Deleted)")
         imap.expunge()
 
-
 def append_to_sent(raw_bytes: bytes):
-    # Faz um login rápido só para APPEND (isola falhas)
     with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
         imap.login(MAIL_USER, MAIL_PASS)
         ensure_mailbox(imap, SENT_FOLDER)
-        # IMPORTANTE: deixe o servidor definir a data (None)
-        imap.append(SENT_FOLDER, r"(\Seen)", None, raw_bytes)
+        imap.append(SENT_FOLDER, r"(\Seen)", None, raw_bytes)  # deixa o servidor definir a data
         imap.logout()
         log.info("Mensagem copiada para a pasta de enviados: %s", SENT_FOLDER)
-
 
 def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_seq: bytes, msg_bytes: bytes):
     msg = BytesParser(policy=policy.default).parsebytes(msg_bytes)
@@ -436,14 +381,8 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_seq: bytes, msg_bytes: bytes
     body_text = extract_text_body(msg)
     cobol_files = extract_cobol_attachments(msg)
 
-    log.debug(
-        "Email de %s / subj='%s' / anexos=%d",
-        to_reply,
-        original_subject,
-        len(cobol_files),
-    )
+    log.debug("Email de %s / subj='%s' / anexos=%d", to_reply, original_subject, len(cobol_files))
 
-    # Monta prompt e chama LLM
     user_prompt = build_user_prompt(original_subject, body_text, cobol_files)
 
     try:
@@ -451,7 +390,6 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_seq: bytes, msg_bytes: bytes
     except Exception as e:
         log.error("LLM error")
         log.exception(e)
-        # Escala o e-mail original
         move_message(imap, msg_seq, _safe_box(FOLDER_ESCALATE))
         log.info("E-mail movido para %s", _safe_box(FOLDER_ESCALATE))
         return
@@ -461,7 +399,6 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_seq: bytes, msg_bytes: bytes
     assunto_model = llm_json.get("assunto", original_subject or "")
     corpo_markdown = llm_json.get("corpo_markdown", "")
 
-    # Política de confiança
     should_answer = (acao == "responder") and (nivel >= CONFIDENCE_THRESHOLD)
 
     if not should_answer:
@@ -469,41 +406,31 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_seq: bytes, msg_bytes: bytes
         log.info("Decisão do modelo: acao=%s conf=%.2f → escalado", acao, nivel)
         return
 
-    # Ajusta assunto para resposta (mantém original, apenas prefixo Re: se faltar)
     subject_to_send = ensure_reply_prefix(original_subject or assunto_model or "")
-
-    # Monta corpo final com assinatura
     body_out = build_outgoing_body(corpo_markdown)
 
-    # Envia
     raw_out = send_email_reply(msg, to_reply, subject_to_send, body_out)
     log.info("E-mail enviado para %s (Subject: %s)", to_reply, subject_to_send)
 
-    # Copia para enviados
     try:
         ensure_mailbox(imap, SENT_FOLDER)
-        # usar sessão separada ajuda, mas mantemos aqui por compat
         append_to_sent(raw_out)
     except Exception as e:
         log.error("Falha ao copiar para enviados")
         log.exception(e)
 
-    # Move original para Respondidos
     move_message(imap, msg_seq, _safe_box(FOLDER_PROCESSED))
     log.info("E-mail movido para %s", _safe_box(FOLDER_PROCESSED))
-
 
 # ==========================
 # Watcher IMAP
 # ==========================
-
 def watch_imap_loop():
     log.info("Watcher IMAP — envio via SMTP %s", SMTP_HOST)
     log.info("App público em: %s", APP_PUBLIC_URL)
     while True:
         try:
             with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
-                # Pré-login caps
                 typ, caps = imap.capability()
                 if typ == "OK" and caps:
                     try:
@@ -525,7 +452,6 @@ def watch_imap_loop():
                     msg_bytes = msg_data[0][1]
                     decide_and_respond(imap, num, msg_bytes)
 
-                # limpeza opcional pós-processamento
                 if EXPUNGE_AFTER_COPY:
                     try:
                         imap.expunge()
@@ -536,7 +462,6 @@ def watch_imap_loop():
         except Exception as e:
             log.exception(e)
         time.sleep(CHECK_INTERVAL_SECONDS)
-
 
 # ==========================
 # Flask app (diagnóstico)
@@ -564,17 +489,18 @@ def diag_openrouter():
             "top_p": 0,
             "response_format": {"type": "json_object"},
             "messages": [
-                # {\1'Responda somente JSON: {"ok":true}'ok\\":true}"},
-                {"role": "user", "content": "ping"},
+                {"role": "system", "content": "Responda SOMENTE JSON válido."},
+                {"role": "user", "content": "Retorne {\"ok\": true}."},
             ],
         }
         headers = {
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
+            "HTTP-Referer": OPENROUTER_SITE_URL or APP_PUBLIC_URL or "",
+            "X-Title": OPENROUTER_APP_NAME,
         }
         r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, data=json.dumps(payload), timeout=20)
         status = r.status_code
-        body = None
         try:
             body = r.json()
         except Exception:
@@ -583,15 +509,10 @@ def diag_openrouter():
     except Exception as e:
         return jsonify({"status": 500, "error": str(e)})
 
-
 if __name__ == "__main__":
-    # roda watcher em thread simples (processo único na Render)
     import threading
-
     t = threading.Thread(target=watch_imap_loop, daemon=True)
     t.start()
 
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
-
-
