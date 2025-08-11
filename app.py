@@ -497,7 +497,7 @@ def diag_openrouter():
             "top_p": 0,
             "response_format": {"type": "json_object"},
             "messages": [
-                {"role": "system", "content": "Responda somente JSON: {\\"ok\\":true}"},
+                {\1'Reponda somente JSON: {"ok":true}'ok\\":true}"},
                 {"role": "user", "content": "ping"},
             ],
         }
@@ -526,4 +526,5 @@ if __name__ == "__main__":
 
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
+
 
