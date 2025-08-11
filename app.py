@@ -24,13 +24,13 @@ import smtplib
 import logging
 import threading
 import traceback
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any
 from email.message import EmailMessage
 from email.policy import default as default_policy
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime, formatdate, make_msgid
 
-from flask import Flask, jsonify, Response
+from flask import Flask, jsonify
 
 # =========================
 # Config / Env
@@ -45,7 +45,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
-# Debug detalhado do imaplib quando LOG_LEVEL=DEBUG
 if logging.getLogger().level <= logging.DEBUG:
     try:
         imaplib.Debug = 4
@@ -77,7 +76,11 @@ EXPUNGE_AFTER_COPY = os.getenv("EXPUNGE_AFTER_COPY", "true").strip().lower() in 
 
 # LLM
 LLM_BACKEND = os.getenv("LLM_BACKEND", "openrouter").strip().lower()
-CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.8"))
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
+
+# Re-ask config
+REASK_ON_ESCALAR = os.getenv("REASK_ON_ESCALAR", "true").strip().lower() in {"1","true","yes","y"}
+REASK_ESCALAR_MIN = float(os.getenv("REASK_ESCALAR_MIN", "0.55"))
 
 # OpenRouter
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
@@ -94,15 +97,17 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 SIGNATURE_NAME = os.getenv("SIGNATURE_NAME", "Equipe Aprenda COBOL — Suporte")
 SIGNATURE_FOOTER = os.getenv(
     "SIGNATURE_FOOTER",
-    "Se precisar, responda este e-mail com mais detalhes ou anexe seu arquivo .COB/.CBL.\nHorário de atendimento: 9h–18h (ET), seg–sex. Conheça nossa Formação Completa de Programadores COBOL, com COBOL Avançado, JCL, Db2 e Bancos de Dados completo em:"
+    "Se precisar, responda este e-mail com mais detalhes ou anexe seu arquivo .COB/.CBL.\n"
+    "Horário de atendimento: 9h–18h (ET), seg–sex. Conheça nossa Formação Completa de Programadores COBOL, "
+    "com COBOL Avançado, JCL, Db2 e Bancos de Dados completo em:"
 )
 SIGNATURE_LINKS = os.getenv("SIGNATURE_LINKS", "https://aprendacobol.com.br/assinatura/")
 
 # =========================
-# Prompt do modelo
+# Prompts
 # =========================
 
-SYSTEM_PROMPT = (
+SYSTEM_PROMPT_BASE = (
     "Você é um assistente de suporte de um curso de COBOL. "
     "SEMPRE produza um JSON VÁLIDO e nada além disso. "
     "Formato do JSON (minificado, sem comentários, sem markdown, sem texto extra): "
@@ -110,16 +115,22 @@ SYSTEM_PROMPT = (
     "Regras: "
     "1) NUNCA inclua crases ou ``` no output. "
     "2) NUNCA acrescente explicações fora do JSON. "
-    "3) Sempre use chaves exatamente como no esquema. "
+    "3) Use exatamente as chaves do esquema. "
     "4) PT-BR no corpo. "
     "5) 'nivel_confianca' entre 0 e 1. "
-    "6) Se pedido estiver claro e respondível, 'acao'='responder' com nivel_confianca>=0.8; "
-    "   se ambíguo/incompleto, 'acao'='escalar' com nivel_confianca<=0.6. "
-    "Analise o e-mail (texto e código anexo ou no corpo do e-mail). Responda educadamente. "
-    "Cite pontos do COBOL (DIVISION, SECTION, PIC, níveis, I/O, SQLCA etc.). "
+    "6) PRIORIZE 'responder' quando houver uma orientação útil; "
+    "   use 'escalar' APENAS quando faltar contexto essencial, for cobrança/conta, ou for altamente técnico sem dados. "
+    "7) Se pedido estiver claro e respondível, 'acao'='responder' com nivel_confianca>=0.8; "
+    "   se ambíguo/incompleto a ponto de não dar para orientar, 'acao'='escalar' (nivel_confianca<=0.6). "
+    "Inclua orientações de COBOL (DIVISION, SECTION, PIC, níveis, I/O, SQLCA etc.) quando fizer sentido. "
     "Sugira passos práticos. "
-    "Se no e-mail tiver qualquer solicitação para entrar no grupo do Telegram, dê o link https://t.me/aprendacobol. "
-    "Sempre ofereça o curso de Formação Completa de Programadore Aprenda COBOl disponível por assinatura em: https://assinatura.aprendacobol.com.br."
+    "Se o e-mail pedir link do Telegram, inclua https://t.me/aprendacobol. "
+    "Sempre ofereça a Formação Completa de Programador COBOL por assinatura em: https://assinatura.aprendacobol.com.br."
+)
+
+SYSTEM_PROMPT_NUDGE = (
+    SYSTEM_PROMPT_BASE +
+    " IMPORTANTE: Procure responder. Se conseguir montar orientação inicial, devolva 'acao'='responder'."
 )
 
 # =========================
@@ -134,25 +145,17 @@ def _normalize_url(u: str) -> str:
     return u.strip().rstrip('/')
 
 def md_links_to_text(md: str) -> str:
-    """Converte Markdown p/ texto puro sem duplicar links.
-       [https://x](https://x) -> https://x
-       [Curso](https://x) -> Curso (https://x)
-    """
     if not md:
         return ""
     s = md
-
     def repl_link(m):
         txt = m.group(1).strip()
         url = m.group(2).strip()
         if _normalize_url(txt).lower() == _normalize_url(url).lower():
             return url
         return f"{txt} ({url})"
-
     s = LINK_MD_RE.sub(repl_link, s)
     s = AUTO_LINK_RE.sub(lambda m: m.group(1), s)
-
-    # remove ênfases básicas do Markdown
     s = s.replace("**", "").replace("__", "")
     s = re.sub(r"(^|[^`])`([^`]+)`", r"\1\2", s)
     return s
@@ -161,46 +164,28 @@ def _escape_outside_anchors(s: str) -> str:
     parts = re.split(r'(<a\b.*?>.*?</a>)', s, flags=re.I | re.S)
     out = []
     for i, part in enumerate(parts):
-        if i % 2 == 1:
-            out.append(part)  # manter <a>
-        else:
-            out.append(html.escape(part))
+        out.append(part if i % 2 == 1 else html.escape(part))
     return ''.join(out)
 
 def md_to_html(md: str) -> str:
-    """Converte um subset de Markdown em HTML simples."""
     if not md:
         return "<!doctype html><html><body></body></html>"
     s = md
-
-    # Links [texto](url)
     def repl_link(m):
         txt = html.escape(m.group(1).strip())
         url = html.escape(m.group(2).strip(), quote=True)
         return f'<a href="{url}">{txt}</a>'
-
     s = LINK_MD_RE.sub(repl_link, s)
-
-    # <https://...>
     s = AUTO_LINK_RE.sub(lambda m: f'<a href="{html.escape(m.group(1), quote=True)}">{html.escape(m.group(1))}</a>', s)
-
-    # Autolink de URLs cruas fora de <a>
     def autolink_raw(segment: str) -> str:
         return RAW_URL_RE.sub(lambda m: f'<a href="{html.escape(m.group(1), quote=True)}">{html.escape(m.group(1))}</a>', segment)
-
     parts = re.split(r'(<a\b.*?>.*?</a>)', s, flags=re.I | re.S)
     s = ''.join(part if i % 2 == 1 else autolink_raw(part) for i, part in enumerate(parts))
-
-    # Escapar fora das âncoras
     s = _escape_outside_anchors(s)
-
-    # Ênfases
     s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
     s = re.sub(r"__([^_]+)__", r"<strong>\1</strong>", s)
     s = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", s)
     s = re.sub(r"(?<!_)_([^_]+)_(?!_)", r"<em>\1</em>", s)
-
-    # Quebras de linha
     s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
     return f"<!doctype html><html><body>{s}</body></html>"
 
@@ -234,9 +219,6 @@ def is_our_own_message(msg) -> bool:
     return MAIL_USER.lower() in from_addr
 
 def find_first_text_part(msg) -> Tuple[str, str]:
-    """
-    Retorna (plain_text, html_text) do e-mail original.
-    """
     plain, htmlp = "", ""
     if msg.is_multipart():
         for part in msg.walk():
@@ -262,35 +244,32 @@ def find_first_text_part(msg) -> Tuple[str, str]:
             htmlp = msg.get_content().strip()
     return plain, htmlp
 
+def clamp_conf(v: Any) -> float:
+    try:
+        x = float(v)
+    except Exception:
+        return 0.0
+    return max(0.0, min(1.0, x))
+
 def safe_json_extract(s: str) -> Optional[Dict[str, Any]]:
-    """
-    Extrai o primeiro objeto JSON válido de uma string.
-    Remove cercas de código se vierem (```json ... ```).
-    """
     if not s:
         return None
     s = s.strip()
-    # remover cercas de código
     if s.startswith("```"):
         s = re.sub(r"^```(\w+)?", "", s).strip()
         if s.endswith("```"):
             s = s[:-3].strip()
-
-    # tentativa direta
     try:
         obj = json.loads(s)
         if isinstance(obj, dict):
             return obj
     except Exception:
         pass
-
-    # Varredura para achar o primeiro {...} que parseia
     opens = [i for i, ch in enumerate(s) if ch == "{"]
     for i in opens:
         depth = 0
         for j in range(i, len(s)):
-            if s[j] == "{":
-                depth += 1
+            if s[j] == "{": depth += 1
             elif s[j] == "}":
                 depth -= 1
                 if depth == 0:
@@ -303,135 +282,120 @@ def safe_json_extract(s: str) -> Optional[Dict[str, Any]]:
                         break
     return None
 
-def clamp_conf(v: Any) -> float:
-    try:
-        x = float(v)
-    except Exception:
-        return 0.0
-    return max(0.0, min(1.0, x))
+# =========================
+# Regras simples antes do LLM
+# =========================
+
+def rule_based_autoreply(subject: str, plain: str, htmlp: str) -> Optional[Dict[str, Any]]:
+    text = " ".join([subject or "", plain or "", re.sub("<[^>]+>", " ", htmlp or "")]).lower()
+
+    # Telegram
+    if any(k in text for k in ["telegram", "grupo do telegram", "link do telegram", "t.me/aprendacobol"]):
+        corpo = (
+            "Claro! Para entrar no nosso grupo de alunos no Telegram, use o link: "
+            "[https://t.me/aprendacobol](https://t.me/aprendacobol)\n\n"
+            "Fique à vontade para postar dúvidas de exercícios e projetos lá. Também recomendo a "
+            "[Formação Completa de Programador COBOL](https://assinatura.aprendacobol.com.br) para aprofundar."
+        )
+        return {"acao":"responder","nivel_confianca":0.95,"assunto":"Re: Grupo do Telegram","corpo_markdown":corpo}
+
+    # Assinatura/curso
+    if any(k in text for k in ["assinatura", "assinar", "formação completa", "formacao completa", "curso", "plano", "preço", "valor"]):
+        corpo = (
+            "Legal! Nossa Formação Completa de Programador COBOL está disponível por assinatura em "
+            "[https://assinatura.aprendacobol.com.br](https://assinatura.aprendacobol.com.br).\n\n"
+            "Você encontra COBOL básico ao avançado, JCL, Db2 e projetos práticos."
+        )
+        subj = "Re: Assinatura / Formação COBOL"
+        return {"acao":"responder","nivel_confianca":0.9,"assunto":subj,"corpo_markdown":corpo}
+
+    return None
 
 # =========================
 # LLM Backends
 # =========================
 
-def llm_decide(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Roteia para o backend configurado e retorna dict com:
-    {'acao','nivel_confianca','assunto','corpo_markdown'}
-    """
+def llm_decide(payload: Dict[str, Any], nudge: bool=False) -> Dict[str, Any]:
     if LLM_BACKEND == "openrouter":
-        return llm_openrouter(payload)
+        return llm_openrouter(payload, nudge=nudge)
     elif LLM_BACKEND == "ollama":
-        return llm_ollama(payload)
+        return llm_ollama(payload, nudge=nudge)
     else:
         logging.warning("LLM_BACKEND desconhecido: %s; usando openrouter", LLM_BACKEND)
-        return llm_openrouter(payload)
+        return llm_openrouter(payload, nudge=nudge)
 
-def llm_openrouter(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_decision(obj: Dict[str, Any]) -> Dict[str, Any]:
+    acao = obj.get("acao") if obj.get("acao") in ("responder","escalar") else "escalar"
+    nivel = clamp_conf(obj.get("nivel_confianca", 0))
+    assunto = str(obj.get("assunto","")).strip()
+    corpo = str(obj.get("corpo_markdown","")).strip()
+    return {"acao":acao,"nivel_confianca":nivel,"assunto":assunto,"corpo_markdown":corpo}
+
+def llm_openrouter(payload: Dict[str, Any], nudge: bool=False) -> Dict[str, Any]:
     import requests
-
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "HTTP-Referer": OPENROUTER_SITE_URL,
         "X-Title": OPENROUTER_APP_NAME,
         "Content-Type": "application/json",
     }
-
+    system = SYSTEM_PROMPT_NUDGE if nudge else SYSTEM_PROMPT_BASE
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": payload.get("input", "")}
+        {"role":"system","content":system},
+        {"role":"user","content":payload.get("input","")}
     ]
-
     body = {
         "model": OPENROUTER_MODEL,
         "messages": messages,
         "max_tokens": OPENROUTER_MAX_TOKENS,
         "temperature": 0.2,
-        # ajuda alguns modelos a só devolver JSON
-        "response_format": {"type": "json_object"},
+        "response_format": {"type":"json_object"},
     }
-
     try:
-        resp = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=body,
-            timeout=60,
-        )
+        resp = requests.post("https://openrouter.ai/api/v1/chat/completions",
+                             headers=headers, json=body, timeout=60)
         logging.debug("OpenRouter status=%s", resp.status_code)
         data = resp.json()
-        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        content = (data.get("choices") or [{}])[0].get("message",{}).get("content","")
         obj = safe_json_extract(content) or {}
+        return _normalize_decision(obj)
     except Exception as e:
         logging.warning("Falha no OpenRouter: %s", e)
-        obj = {}
+        return {"acao":"escalar","nivel_confianca":0.0,"assunto":"","corpo_markdown":""}
 
-    # Normalizar/validar
-    acao = obj.get("acao") if obj.get("acao") in ("responder", "escalar") else "escalar"
-    nivel = clamp_conf(obj.get("nivel_confianca", 0))
-    assunto = str(obj.get("assunto", "")).strip()
-    corpo = str(obj.get("corpo_markdown", "")).strip()
-
-    return {
-        "acao": acao,
-        "nivel_confianca": nivel,
-        "assunto": assunto,
-        "corpo_markdown": corpo,
-    }
-
-def llm_ollama(payload: Dict[str, Any]) -> Dict[str, Any]:
+def llm_ollama(payload: Dict[str, Any], nudge: bool=False) -> Dict[str, Any]:
     import requests
+    system = SYSTEM_PROMPT_NUDGE if nudge else SYSTEM_PROMPT_BASE
     prompt = (
-        SYSTEM_PROMPT
-        + "\n\n---\nE-MAIL A SEGUIR:\n"
-        + payload.get("input", "")
-        + "\n---"
-        "\nResponda APENAS com o JSON minificado."
+        system + "\n\n---\nE-MAIL A SEGUIR:\n" +
+        payload.get("input","") +
+        "\n---\nResponda APENAS com o JSON minificado."
     )
-    body = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "options": {"temperature": 0.2},
-        "stream": False,
-    }
+    body = {"model": OLLAMA_MODEL, "prompt": prompt, "options":{"temperature":0.2}, "stream": False}
     try:
         resp = requests.post(f"{OLLAMA_HOST}/api/generate", json=body, timeout=60)
         data = resp.json()
-        content = data.get("response", "")
+        content = data.get("response","")
         obj = safe_json_extract(content) or {}
+        return _normalize_decision(obj)
     except Exception as e:
         logging.warning("Falha no Ollama: %s", e)
-        obj = {}
-
-    acao = obj.get("acao") if obj.get("acao") in ("responder", "escalar") else "escalar"
-    nivel = clamp_conf(obj.get("nivel_confianca", 0))
-    assunto = str(obj.get("assunto", "")).strip()
-    corpo = str(obj.get("corpo_markdown", "")).strip()
-    return {
-        "acao": acao,
-        "nivel_confianca": nivel,
-        "assunto": assunto,
-        "corpo_markdown": corpo,
-    }
+        return {"acao":"escalar","nivel_confianca":0.0,"assunto":"","corpo_markdown":""}
 
 # =========================
-# IMAP Helpers
+# IMAP helpers
 # =========================
 
 def imap_connect() -> imaplib.IMAP4_SSL:
-    logging.debug("CAPABILITIES: (aferir após LOGIN)")
     ctx = ssl.create_default_context()
     imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ctx)
-    # opcional: ver capacidades antes do login
     try:
         typ, data = imap.capability()
-        caps = []
         if typ == 'OK' and data:
             caps = data[0].decode().upper().split()
-        logging.debug("CAPABILITIES: %s", " ".join([c for c in caps if c != "CAPABILITY"]))
+            logging.debug("CAPABILITIES: %s", " ".join([c for c in caps if c != "CAPABILITY"]))
     except Exception:
         pass
-
     imap.login(MAIL_USER, MAIL_PASS)
     return imap
 
@@ -441,14 +405,14 @@ def ensure_mailbox(imap: imaplib.IMAP4_SSL, name: str):
         if typ == "OK":
             logging.info("Mailbox criada: %s", name)
     except Exception:
-        # se já existe, segue
         pass
 
 def move_message(imap: imaplib.IMAP4_SSL, msg_id: bytes, target_box: str):
-    ensure_mailbox(imap, f"INBOX.{target_box}" if not target_box.upper().startswith("INBOX") else target_box)
-    dest = f"INBOX.{target_box}" if not target_box.upper().startswith("INBOX") else target_box
+    dest = target_box
+    if not target_box.upper().startswith("INBOX"):
+        dest = f"INBOX.{target_box}"
+    ensure_mailbox(imap, dest)
     imap.copy(msg_id, dest)
-    # marcar como deletado na INBOX
     imap.store(msg_id, "+FLAGS", r"(\Deleted)")
     if EXPUNGE_AFTER_COPY:
         imap.expunge()
@@ -457,41 +421,28 @@ def move_message(imap: imaplib.IMAP4_SSL, msg_id: bytes, target_box: str):
 # SMTP + Append em Enviados
 # =========================
 
-def smtp_send_and_append(
-    to_addr: str,
-    subject: str,
-    body_markdown: str,
-    orig_msg: email.message.Message,
-) -> Tuple[bool, Optional[str]]:
-    """
-    Envia via SMTP (multipart/alternative) e faz APPEND no SENT_FOLDER do IMAP.
-    Retorna (ok, message_id).
-    """
+def smtp_send_and_append(to_addr: str, subject: str, body_markdown: str, orig_msg: email.message.Message):
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = MAIL_USER
     msg["To"] = to_addr
 
-    # threading headers
     orig_msgid = (orig_msg.get("Message-ID") or "").strip()
     if orig_msgid:
         msg["In-Reply-To"] = orig_msgid
         refs = (orig_msg.get("References") or "").strip()
         msg["References"] = (refs + " " + orig_msgid).strip()
 
-    # id e data
     msg["Message-ID"] = make_msgid()
     msg["Date"] = formatdate(localtime=True)
 
-    # corpo: markdown -> plain + html
     full_md = body_markdown.strip() + make_signature()
     plain_text = md_links_to_text(full_md)
-    html_body = md_to_html(full_md)
+    html_body  = md_to_html(full_md)
 
     msg.set_content(plain_text, subtype="plain", charset="utf-8")
     msg.add_alternative(html_body, subtype="html")
 
-    # Envio SMTP
     try:
         if SMTP_TLS_MODE == "ssl":
             context = ssl.create_default_context()
@@ -512,7 +463,6 @@ def smtp_send_and_append(
         logging.error("Falha no envio SMTP: %s", e)
         return False, None
 
-    # Append em Enviados
     try:
         imap = imap_connect()
         ensure_mailbox(imap, SENT_FOLDER)
@@ -527,15 +477,14 @@ def smtp_send_and_append(
     return True, msg["Message-ID"]
 
 # =========================
-# Core: Processamento
+# Core
 # =========================
 
 def assemble_llm_input(orig_msg: email.message.Message, plain: str, htmlp: str) -> str:
     subj = decode_str(orig_msg.get("Subject", ""))
     from_ = decode_str(orig_msg.get("From", ""))
-    to_ = decode_str(orig_msg.get("To", ""))
+    to_   = decode_str(orig_msg.get("To", ""))
     date_ = decode_str(orig_msg.get("Date", ""))
-
     lines = [
         f"De: {from_}",
         f"Para: {to_}",
@@ -557,27 +506,44 @@ def decide_and_act(imap: imaplib.IMAP4_SSL, msg_id: bytes, msg: email.message.Me
         return
 
     plain, htmlp = find_first_text_part(msg)
-    llm_input = assemble_llm_input(msg, plain, htmlp)
+    orig_subj = decode_str(msg.get("Subject", "")).strip()
 
-    decision = llm_decide({"input": llm_input})
-    acao = decision.get("acao", "escalar")
-    nivel = decision.get("nivel_confianca", 0.0)
-    assunto_resp = decision.get("assunto", "").strip()
-    corpo_md = decision.get("corpo_markdown", "").strip()
+    # 1) Regras simples antes do LLM
+    rb = rule_based_autoreply(orig_subj, plain, htmlp)
+    if rb:
+        acao = "responder"
+        nivel = rb["nivel_confianca"]
+        assunto_resp = rb["assunto"] or (f"Re: {orig_subj}" if not orig_subj.lower().startswith("re:") else orig_subj)
+        corpo_md = rb["corpo_markdown"]
+        logging.info("Regra simples aplicada: acao=responder conf=%.2f", nivel)
+    else:
+        # 2) LLM pass 1
+        llm_input = assemble_llm_input(msg, plain, htmlp)
+        decision = llm_decide({"input": llm_input}, nudge=False)
+        acao = decision.get("acao","escalar")
+        nivel = decision.get("nivel_confianca",0.0)
+        assunto_resp = decision.get("assunto","").strip()
+        corpo_md = decision.get("corpo_markdown","").strip()
 
-    # Política de segurança: se pediu responder mas confiança < threshold, escalar
+        # 3) Se veio 'escalar' porém confiança não é tão baixa, tentar 2ª passada incentivando resposta
+        if acao == "escalar" and REASK_ON_ESCALAR and nivel >= REASK_ESCALAR_MIN:
+            logging.info("Reask ativado (acao=escalar conf=%.2f >= %.2f). Tentando 2ª passada.",
+                         nivel, REASK_ESCALAR_MIN)
+            decision2 = llm_decide({"input": llm_input}, nudge=True)
+            if decision2.get("acao") == "responder":
+                acao = "responder"
+                nivel = decision2.get("nivel_confianca", nivel)
+                assunto_resp = decision2.get("assunto","").strip() or assunto_resp
+                corpo_md = decision2.get("corpo_markdown","").strip() or corpo_md
+
+    # Segurança: se pediu responder, mas confiança muito baixa, volta a escalar
     if acao == "responder" and nivel < CONFIDENCE_THRESHOLD:
         logging.info("Confiança baixa (%.2f < %.2f). Alterando ação para 'escalar'.", nivel, CONFIDENCE_THRESHOLD)
         acao = "escalar"
 
-    # Assunto de resposta
-    orig_subj = decode_str(msg.get("Subject", "")).strip()
-    if not assunto_resp:
-        assunto_resp = f"Re: {orig_subj}" if not orig_subj.lower().startswith("re:") else orig_subj
-
-    logging.info("Decisão do modelo: acao=%s conf=%.2f", acao, nivel)
-
     if acao == "responder":
+        if not assunto_resp:
+            assunto_resp = f"Re: {orig_subj}" if not orig_subj.lower().startswith("re:") else orig_subj
         to_addr = (email.utils.parseaddr(msg_get_addresses(msg, "Reply-To"))[1]
                    or email.utils.parseaddr(msg_get_addresses(msg, "From"))[1]
                    or "")
@@ -585,10 +551,8 @@ def decide_and_act(imap: imaplib.IMAP4_SSL, msg_id: bytes, msg: email.message.Me
             logging.warning("Sem destinatário para responder; escalando.")
             move_message(imap, msg_id, FOLDER_ESCALATE)
             return
-
         ok, _ = smtp_send_and_append(to_addr, assunto_resp, corpo_md, msg)
         if ok:
-            # mover original p/ Respondidos
             target = FOLDER_PROCESSED if FOLDER_PROCESSED else "Respondidos"
             move_message(imap, msg_id, target)
             logging.info("E-mail movido para INBOX.%s", target)
@@ -596,7 +560,6 @@ def decide_and_act(imap: imaplib.IMAP4_SSL, msg_id: bytes, msg: email.message.Me
             move_message(imap, msg_id, FOLDER_ESCALATE)
             logging.info("Falha no envio; e-mail movido para INBOX.%s", FOLDER_ESCALATE)
     else:
-        # Escalar sempre
         move_message(imap, msg_id, FOLDER_ESCALATE)
         logging.info("E-mail movido para INBOX.%s", FOLDER_ESCALATE)
 
@@ -646,33 +609,20 @@ def healthz():
 
 @app.route("/diag/openrouter-chat")
 def diag_openrouter():
-    """
-    Teste rápido do backend de LLM. Não usa mail — só ecoa.
-    """
     sample = (
         "Assunto: Teste\n"
         "De: Aluno <aluno@exemplo.com>\n\n"
         "Oi, como entro no grupo do Telegram e a assinatura do curso?"
     )
-    dec = llm_decide({"input": sample})
-    return jsonify({
-        "ok": True,
-        "model": OPENROUTER_MODEL,
-        "decision": dec,
-        "headers_hint": {
-            "HTTP-Referer": OPENROUTER_SITE_URL,
-            "X-Title": OPENROUTER_APP_NAME
-        }
-    })
+    dec1 = llm_decide({"input": sample}, nudge=False)
+    dec2 = llm_decide({"input": sample}, nudge=True)
+    return jsonify({"ok": True, "model": OPENROUTER_MODEL, "first": dec1, "nudge": dec2})
 
 # =========================
 # Main
 # =========================
 
 if __name__ == "__main__":
-    # thread do watcher
     t = threading.Thread(target=background_loop, daemon=True)
     t.start()
-
-    # servidor http
     app.run(host="0.0.0.0", port=PORT)
