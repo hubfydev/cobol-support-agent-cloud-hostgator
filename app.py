@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 - v9.7
+#!/usr/bin/env python3 - v9.8
 # -*- coding: utf-8 -*-
 
 """
@@ -18,13 +18,14 @@ import hashlib
 import logging
 import imaplib
 import smtplib
+
 from email import policy
 from email.parser import BytesParser
 from email.message import EmailMessage
 from email.header import decode_header, make_header
-from email.utils import formatdate
+from email.utils import formatdate, make_msgid
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 # ==========================
 # Config & Logging
@@ -56,6 +57,7 @@ SMTP_DEBUG = int(os.getenv("SMTP_DEBUG", "0"))
 LLM_BACKEND = os.getenv("LLM_BACKEND", "openrouter")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/auto")
+OPENROUTER_MODEL_FALLBACK = os.getenv("OPENROUTER_MODEL_FALLBACK", "openrouter/auto")
 OPENROUTER_MAX_TOKENS = int(os.getenv("OPENROUTER_MAX_TOKENS", "512"))
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "COBOL Support Agent")
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
@@ -69,8 +71,6 @@ APP_TITLE = os.getenv("APP_TITLE", "COBOL Support Agent")
 # Assinatura / rodapé
 SIGNATURE_NAME = os.getenv("SIGNATURE_NAME", "Equipe Aprenda COBOL — Suporte")
 SIGNATURE_FOOTER = os.getenv(
-    # logo após carregar SIGNATURE_FOOTER do os.getenv:
-    SIGNATURE_FOOTER = SIGNATURE_FOOTER.replace("\\n", "\n")
     "SIGNATURE_FOOTER",
     (
         "Se precisar, responda este e-mail com mais detalhes ou anexe seu arquivo .COB/.CBL.\n"
@@ -79,6 +79,8 @@ SIGNATURE_FOOTER = os.getenv(
         "JCL, Db2 e Bancos de Dados completo em:"
     ),
 )
+# Normaliza '\n' literais vindos da env var
+SIGNATURE_FOOTER = SIGNATURE_FOOTER.replace("\\n", "\n")
 SIGNATURE_LINKS = os.getenv("SIGNATURE_LINKS", "https://aprendacobol.com.br/assinatura/")
 
 # ==========================
@@ -110,12 +112,14 @@ SYSTEM_PROMPT = (
 
 # sha1 do prompt para diagnóstico
 SYSTEM_PROMPT_SHA1 = hashlib.sha1(SYSTEM_PROMPT.encode("utf-8")).hexdigest()
-log.info("SYSTEM_PROMPT_SHA1=%s (primeiros 120 chars): %s", SYSTEM_PROMPT_SHA1[:12], SYSTEM_PROMPT[:120])
+log.info(
+    "SYSTEM_PROMPT_SHA1=%s (primeiros 120 chars): %s",
+    SYSTEM_PROMPT_SHA1[:12], SYSTEM_PROMPT[:120]
+)
 
 # ==========================
 # Utilitários de e-mail
 # ==========================
-
 def _safe_box(name: str) -> str:
     if name.upper().startswith("INBOX"):
         return name
@@ -200,52 +204,72 @@ def extract_cobol_attachments(msg, max_bytes=80_000):
 # ==========================
 import requests
 
-def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
-    url = "https://openrouter.ai/api/v1/chat/completions"
+def _post_openrouter(payload):
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
         "HTTP-Referer": OPENROUTER_SITE_URL or APP_PUBLIC_URL or "",
         "X-Title": OPENROUTER_APP_NAME,
     }
+    return requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=headers,
+        data=json.dumps(payload),
+        timeout=60,
+    )
 
-    # 1) Preferimos function-calling para garantir JSON estruturado
-    tools = [{
-        "type": "function",
-        "function": {
-            "name": "compose_email",
-            "description": "Retorne somente os campos exigidos no esquema.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "assunto": {"type": "string"},
-                    "corpo_markdown": {"type": "string"},
-                    "nivel_confianca": {"type": "number"},
-                    "acao": {"type": "string", "enum": ["responder", "escalar"]}
-                },
-                "required": ["assunto", "corpo_markdown", "nivel_confianca", "acao"],
-                "additionalProperties": False
-            }
-        }
-    }]
-
-    payload = {
+def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
+    # 1) Tentativa com function-calling (mais confiável pra JSON)
+    base_payload = {
         "model": OPENROUTER_MODEL,
         "max_tokens": OPENROUTER_MAX_TOKENS,
         "temperature": 0.0,
         "top_p": 0,
-        # alguns provedores obedecem isso, outros não — deixamos como “cinto e suspensório”
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "tools": tools,
-        "tool_choice": "required",  # força retorno via function-calling
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "compose_email",
+                "description": "Retorne somente os campos exigidos no esquema.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "assunto": {"type": "string"},
+                        "corpo_markdown": {"type": "string"},
+                        "nivel_confianca": {"type": "number"},
+                        "acao": {"type": "string", "enum": ["responder", "escalar"]}
+                    },
+                    "required": ["assunto", "corpo_markdown", "nivel_confianca", "acao"],
+                    "additionalProperties": False
+                }
+            }
+        }],
+        "tool_choice": "required",
     }
 
-    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+    r = _post_openrouter(base_payload)
     log.debug("OpenRouter status=%s", r.status_code)
+
+    # 2) Fallback de modelo/payload quando 402/404/429/500
+    if r.status_code in (402, 404, 429, 500):
+        simple_payload = {
+            "model": OPENROUTER_MODEL_FALLBACK,
+            "max_tokens": OPENROUTER_MAX_TOKENS,
+            "temperature": 0.0,
+            "top_p": 0,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        r = _post_openrouter(simple_payload)
+        log.debug("OpenRouter fallback status=%s", r.status_code)
+
     if r.status_code != 200:
         raise RuntimeError(f"OpenRouter HTTP {r.status_code}")
 
@@ -253,7 +277,7 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
 
-    # 2) Caminho feliz: tool_calls (function calling)
+    # 3) Caminho feliz: tool_calls
     tool_calls = message.get("tool_calls") or []
     if tool_calls:
         try:
@@ -262,11 +286,10 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
         except Exception as e:
             log.debug("Falha ao parsear tool_call.arguments: %s", e)
 
-    # 3) Alternativo: conteúdo “normal” (alguns modelos/rotas ainda fazem isso)
+    # 4) Conteúdo “normal”
     content = (message.get("content") or "").strip()
     log.debug("LLM raw content (primeiros 400 chars): %s", content[:400])
 
-    # 3.1) Padrão comum: ```json ... ```
     m = re.search(r"```(?:json)?\s*({.*})\s*```", content, flags=re.S)
     if m:
         try:
@@ -274,8 +297,7 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
         except Exception:
             pass
 
-    # 3.2) Tira cercas e tenta achar o primeiro objeto JSON balanceado
-    content_no_ticks = content.replace("```json", "```").strip("`").strip()
+    content = content.replace("```json", "```").strip("`").strip()
 
     def _first_json_object(s: str):
         start = s.find("{")
@@ -306,48 +328,11 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
             start = s.find("{", start + 1)
         return None
 
-    obj = _first_json_object(content_no_ticks)
+    obj = _first_json_object(content)
     if obj is not None:
         return obj
 
-    # 4) Nada reconhecível → falha clara (o fluxo de cima já escala o e-mail)
     raise ValueError("Resposta do LLM sem JSON reconhecível.")
-    # fallback: extrair o primeiro objeto JSON balanceando chaves
-    def _first_json_object(s: str):
-        start = s.find("{")
-        while start != -1:
-            depth = 0
-            in_str = False
-            esc = False
-            for i in range(start, len(s)):
-                ch = s[i]
-                if in_str:
-                    if esc:
-                        esc = False
-                    elif ch == "\\":
-                        esc = True
-                    elif ch == '"':
-                        in_str = False
-                else:
-                    if ch == '"':
-                        in_str = True
-                    elif ch == "{":
-                        depth += 1
-                    elif ch == "}":
-                        depth -= 1
-                        if depth == 0:
-                            candidate = s[start:i+1]
-                            try:
-                                return json.loads(candidate)
-                            except Exception:
-                                break
-            start = s.find("{", start + 1)
-        return None
-
-    obj = _first_json_object(content)
-    if obj is None:
-        raise ValueError("Resposta do LLM sem JSON reconhecível.")
-    return obj
 
 # ==========================
 # Fluxo principal
@@ -375,7 +360,6 @@ def build_user_prompt(original_subject: str, body_text: str, cobol_files: list) 
         "Se der para responder, produza resposta objetiva e educada, com observações sobre o código COBOL quando houver. "
         "Use URLs em texto puro nas chamadas para ação."
     )
-
     return "\n".join(parts)
 
 def build_outgoing_body(corpo_markdown: str) -> str:
@@ -395,30 +379,34 @@ def build_outgoing_body(corpo_markdown: str) -> str:
 def send_email_reply(original_msg, to_addr: str, subject: str, body_text: str) -> bytes:
     msg = EmailMessage()
     msg["From"] = MAIL_USER
+    msg["Sender"] = MAIL_USER  # ajuda na alinhamento com o domínio
     msg["To"] = to_addr
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid(domain="aprendacobol.com.br")
+    msg["Message-ID"] = make_msgid(domain=(MAIL_USER.split("@", 1)[-1] if MAIL_USER and "@" in MAIL_USER else None))
+    msg["X-Mailer"] = "COBOL Support Agent"
 
-    # threading headers
-    orig_msgid = original_msg.get("Message-ID")
-    if orig_msgid:
-        msg["In-Reply-To"] = orig_msgid
-        refs = original_msg.get_all("References", [])
-        ref_line = " ".join(refs + [orig_msgid]) if refs else orig_msgid
-        msg["References"] = ref_line
+    # threading headers (se houver original)
+    if original_msg:
+        try:
+            orig_msgid = original_msg.get("Message-ID")
+        except Exception:
+            orig_msgid = None
+        if orig_msgid:
+            msg["In-Reply-To"] = orig_msgid
+            refs = original_msg.get_all("References", [])
+            ref_line = " ".join(refs + [orig_msgid]) if refs else orig_msgid
+            msg["References"] = ref_line
 
     msg.set_content(body_text)
 
     def _send(smtp):
-        smtp.set_debuglevel(int(os.getenv("SMTP_DEBUG", "0")))
+        smtp.set_debuglevel(SMTP_DEBUG)
         smtp.ehlo()
         if SMTP_TLS_MODE == "starttls":
             smtp.starttls(context=ssl.create_default_context())
             smtp.ehlo()
         smtp.login(MAIL_USER, MAIL_PASS)
-
-        # sendmail retorna dicionário de recusas por RCPT
         refused = smtp.sendmail(MAIL_USER, [to_addr], msg.as_string())
         if refused:
             log.error("SMTP recusou destinatários: %s", refused)
@@ -432,7 +420,7 @@ def send_email_reply(original_msg, to_addr: str, subject: str, body_text: str) -
             _send(s)
 
     return msg.as_bytes()
-    
+
 def ensure_mailbox(imap: imaplib.IMAP4_SSL, box: str):
     try:
         imap.create(box)
@@ -498,9 +486,8 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_seq: bytes, msg_bytes: bytes
     try:
         ensure_mailbox(imap, SENT_FOLDER)
         append_to_sent(raw_out)
-    except Exception as e:
-        log.error("Falha ao copiar para enviados")
-        log.exception(e)
+    except Exception:
+        log.error("Falha ao copiar para enviados", exc_info=True)
 
     move_message(imap, msg_seq, _safe_box(FOLDER_PROCESSED))
     log.info("E-mail movido para %s", _safe_box(FOLDER_PROCESSED))
@@ -542,8 +529,8 @@ def watch_imap_loop():
                         pass
 
                 imap.logout()
-        except Exception as e:
-            log.exception(e)
+        except Exception:
+            log.exception("Loop IMAP falhou")
         time.sleep(CHECK_INTERVAL_SECONDS)
 
 # ==========================
@@ -576,13 +563,7 @@ def diag_openrouter():
                 {"role": "user", "content": "Retorne {\"ok\": true}."},
             ],
         }
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": OPENROUTER_SITE_URL or APP_PUBLIC_URL or "",
-            "X-Title": OPENROUTER_APP_NAME,
-        }
-        r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, data=json.dumps(payload), timeout=20)
+        r = _post_openrouter(payload)
         status = r.status_code
         try:
             body = r.json()
@@ -591,6 +572,20 @@ def diag_openrouter():
         return jsonify({"status": status, "body": body})
     except Exception as e:
         return jsonify({"status": 500, "error": str(e)})
+
+@app.route("/diag/smtp")
+def diag_smtp():
+    """Envia um e-mail de teste simples: /diag/smtp?to=dest@exemplo.com"""
+    to = request.args.get("to", MAIL_USER)
+    subject = "Teste SMTP — COBOL Support Agent"
+    body = "Olá! Este é um teste de envio SMTP direto do /diag/smtp.\n\n— Sistema"
+    try:
+        raw = send_email_reply(None, to, subject, body)
+        append_to_sent(raw)
+        return jsonify({"ok": True, "to": to})
+    except Exception as e:
+        log.exception("Falha no /diag/smtp")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
     import threading
