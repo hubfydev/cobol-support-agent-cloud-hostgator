@@ -207,34 +207,109 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
         "X-Title": OPENROUTER_APP_NAME,
     }
 
+    # 1) Preferimos function-calling para garantir JSON estruturado
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "compose_email",
+            "description": "Retorne somente os campos exigidos no esquema.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "assunto": {"type": "string"},
+                    "corpo_markdown": {"type": "string"},
+                    "nivel_confianca": {"type": "number"},
+                    "acao": {"type": "string", "enum": ["responder", "escalar"]}
+                },
+                "required": ["assunto", "corpo_markdown", "nivel_confianca", "acao"],
+                "additionalProperties": False
+            }
+        }
+    }]
+
     payload = {
         "model": OPENROUTER_MODEL,
         "max_tokens": OPENROUTER_MAX_TOKENS,
-        "temperature": 0.1,
+        "temperature": 0.0,
         "top_p": 0,
-        "response_format": {"type": "json_object"},  # força JSON
+        # alguns provedores obedecem isso, outros não — deixamos como “cinto e suspensório”
+        "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
+        "tools": tools,
+        "tool_choice": "required",  # força retorno via function-calling
     }
 
     r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
     log.debug("OpenRouter status=%s", r.status_code)
-
     if r.status_code != 200:
         raise RuntimeError(f"OpenRouter HTTP {r.status_code}")
 
     data = r.json()
-    content = (data.get("choices", [{}])[0].get("message", {}).get("content", "") or "")
-    content = content.strip().strip("`")
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
 
-    # caminho feliz: já veio JSON limpo
-    try:
-        return json.loads(content)
-    except Exception:
-        pass
+    # 2) Caminho feliz: tool_calls (function calling)
+    tool_calls = message.get("tool_calls") or []
+    if tool_calls:
+        try:
+            args_str = tool_calls[0]["function"]["arguments"]
+            return json.loads(args_str)
+        except Exception as e:
+            log.debug("Falha ao parsear tool_call.arguments: %s", e)
 
+    # 3) Alternativo: conteúdo “normal” (alguns modelos/rotas ainda fazem isso)
+    content = (message.get("content") or "").strip()
+    log.debug("LLM raw content (primeiros 400 chars): %s", content[:400])
+
+    # 3.1) Padrão comum: ```json ... ```
+    m = re.search(r"```(?:json)?\s*({.*})\s*```", content, flags=re.S)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+
+    # 3.2) Tira cercas e tenta achar o primeiro objeto JSON balanceado
+    content_no_ticks = content.replace("```json", "```").strip("`").strip()
+
+    def _first_json_object(s: str):
+        start = s.find("{")
+        while start != -1:
+            depth, in_str, esc = 0, False, False
+            for i in range(start, len(s)):
+                ch = s[i]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                else:
+                    if ch == '"':
+                        in_str = True
+                    elif ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            candidate = s[start:i+1]
+                            try:
+                                return json.loads(candidate)
+                            except Exception:
+                                break
+            start = s.find("{", start + 1)
+        return None
+
+    obj = _first_json_object(content_no_ticks)
+    if obj is not None:
+        return obj
+
+    # 4) Nada reconhecível → falha clara (o fluxo de cima já escala o e-mail)
+    raise ValueError("Resposta do LLM sem JSON reconhecível.")
     # fallback: extrair o primeiro objeto JSON balanceando chaves
     def _first_json_object(s: str):
         start = s.find("{")
