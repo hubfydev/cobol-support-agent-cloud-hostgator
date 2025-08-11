@@ -68,7 +68,8 @@ MAIL_PASS          = os.getenv("MAIL_PASS") or os.getenv("IMAP_PASS", "")
 
 FOLDER_ESCALATE    = os.getenv("FOLDER_ESCALATE", "Escalar")
 FOLDER_PROCESSED   = os.getenv("FOLDER_PROCESSED", "Respondidos")
-SENT_FOLDER        = os.getenv("SENT_FOLDER", "INBOX.Sent")
+SENT_FOLDER        = os.getenv("SENT_FOLDER", "INBOX.Sent")  # você pode mudar para INBOX.Enviados
+SAVE_SENT_COPY     = os.getenv("SAVE_SENT_COPY", "true").lower() == "true"
 
 CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
 EXPUNGE_AFTER_COPY = os.getenv("EXPUNGE_AFTER_COPY", "true").lower() == "true"
@@ -98,14 +99,17 @@ OR_MAX_TOKENS   = int(os.getenv("OPENROUTER_MAX_TOKENS", "512"))
 OR_APP_NAME     = os.getenv("OPENROUTER_APP_NAME", APP_TITLE)
 OR_SITE_URL     = os.getenv("OPENROUTER_SITE_URL", APP_PUBLIC_URL)
 
-# Ollama (não usado por padrão, mas deixado pronto)
+# Ollama (placeholder)
 OLLAMA_HOST     = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 
 PORT            = int(os.getenv("PORT", "10000"))
 
+# cache da pasta de enviados detectada
+_DETECTED_SENT_FOLDER = None
+
 # -----------------------------
-# Prompt do modelo (como você pediu)
+# Prompt do modelo
 # -----------------------------
 SYSTEM_PROMPT = (
     "Você é um assistente de suporte de um curso de COBOL. "
@@ -130,6 +134,8 @@ SYSTEM_PROMPT = (
 # Utils
 # -----------------------------
 def ensure_inbox_prefix(folder: str) -> str:
+    if not folder:
+        return "INBOX.Sent"
     if folder.upper().startswith("INBOX"):
         return folder
     return f"INBOX.{folder}"
@@ -141,7 +147,6 @@ def decode_mime_header(value: str) -> str:
         return value or ""
 
 def get_msg_text(msg) -> str:
-    # tenta text/plain; se não, text/html -> strip tags simples
     if msg.is_multipart():
         for part in msg.walk():
             ctype = part.get_content_type()
@@ -162,7 +167,6 @@ def get_msg_text(msg) -> str:
                     html = part.get_content()
                 except Exception:
                     html = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", errors="replace")
-                # remove tags simples
                 text = re.sub(r"(?s)<(script|style).*?>.*?</\1>", "", html, flags=re.I)
                 text = re.sub(r"(?s)<br\s*/?>", "\n", text, flags=re.I)
                 text = re.sub(r"(?s)</p\s*>", "\n\n", text, flags=re.I)
@@ -194,16 +198,9 @@ def make_signature() -> str:
     return "\n\n" + "\n".join(parts).strip() if parts else ""
 
 def sanitize_model_text_to_json(text: str) -> str:
-    """
-    Remove crases/markdown, pega o primeiro objeto JSON balanceando chaves.
-    """
     if not text:
         return ""
-
-    # remove crases/triple backticks e espaços fora
     text = text.strip().strip("`").strip()
-
-    # encontre o primeiro '{' e balanceie até o '}' correspondente
     start = text.find("{")
     if start == -1:
         return ""
@@ -226,65 +223,41 @@ def sanitize_model_text_to_json(text: str) -> str:
             elif ch == "}":
                 brace -= 1
                 if brace == 0:
-                    candidate = text[start:i+1]
-                    return candidate
+                    return text[start:i+1]
     return ""
 
 def parse_llm_json(text: str):
-    """
-    Tenta carregar JSON estrito; se falhar, tenta sanitizar e carregar.
-    Retorna dict ou None.
-    """
     if not text:
         return None
-
     def try_load(s):
         try:
             return json.loads(s)
         except Exception:
             return None
-
-    # tentativa direta
     data = try_load(text)
     if data is not None:
         return data
-
-    # sanitiza
     cand = sanitize_model_text_to_json(text)
     data = try_load(cand)
     if data is not None:
         return data
-
-    # último recurso: troca aspas “ ” por "
     cand2 = cand.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
     data = try_load(cand2)
-    if data is not None:
-        return data
-
-    return None
+    return data
 
 def normalize_decision(d: dict):
-    """
-    Garante chaves e tipos esperados. Retorna (acao, nivel, assunto, corpo)
-    """
     if not isinstance(d, dict):
         return None
-
     acao = str(d.get("acao", "")).strip().lower()
     if acao not in ("responder", "escalar"):
-        # se vier algo diferente, vamos escalar por segurança
         acao = "escalar"
-
     try:
         nivel = float(d.get("nivel_confianca", 0.0))
     except Exception:
         nivel = 0.0
-    if nivel < 0.0: nivel = 0.0
-    if nivel > 1.0: nivel = 1.0
-
+    nivel = max(0.0, min(1.0, nivel))
     assunto = str(d.get("assunto", "") or "").strip()
     corpo = str(d.get("corpo_markdown", "") or "").strip()
-
     return acao, nivel, assunto, corpo
 
 # -----------------------------
@@ -295,7 +268,6 @@ def call_openrouter(messages):
     headers = {
         "Authorization": f"Bearer {OR_API_KEY}",
         "Content-Type": "application/json",
-        # Boas práticas do OpenRouter:
         "HTTP-Referer": OR_SITE_URL or APP_PUBLIC_URL or "https://example.com",
         "X-Title": OR_APP_NAME or APP_TITLE or "App",
     }
@@ -308,7 +280,6 @@ def call_openrouter(messages):
     resp = requests.post(url, headers=headers, json=payload, timeout=60)
     resp.raise_for_status()
     j = resp.json()
-    # estrutura padrão: choices[0].message.content
     content = (j.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
     return content
 
@@ -329,18 +300,69 @@ def classify_email_with_llm(subject: str, sender: str, body: str) -> dict | None
         except Exception as e:
             log.warning("Falha ao chamar OpenRouter: %s", e)
             return None
-    elif LLM_BACKEND == "ollama":
-        # placeholder (não utilizado neste projeto)
-        log.warning("LLM_BACKEND=ollama ainda não implementado aqui; escalando.")
-        return None
     else:
-        log.warning("LLM_BACKEND desconhecido: %s; escalando.", LLM_BACKEND)
+        log.warning("LLM_BACKEND desconhecido ou não implementado: %s; escalando.", LLM_BACKEND)
         return None
 
 # -----------------------------
-# SMTP
+# SMTP + salvar cópia em Enviados
 # -----------------------------
-def smtp_send_reply(to_addr: str, subject: str, body_markdown: str, in_reply_to_msgid: str | None, original_msg):
+def imap_ensure_folder(imap, folder_name: str):
+    try:
+        typ, _ = imap.create(folder_name)
+        # se já existe, vem NO [ALREADYEXISTS]; ignoramos
+    except Exception:
+        pass
+
+def imap_detect_sent_folder(imap) -> str:
+    """
+    Tenta detectar a pasta marcada com \Sent. Se não achar, usa SENT_FOLDER (com INBOX.*).
+    Cacheia o resultado para não listar toda hora.
+    """
+    global _DETECTED_SENT_FOLDER
+    if _DETECTED_SENT_FOLDER:
+        return _DETECTED_SENT_FOLDER
+
+    prefer = ensure_inbox_prefix(SENT_FOLDER)
+    try:
+        typ, data = imap.list("", "*")
+        if typ == "OK" and data:
+            for raw in data:
+                try:
+                    line = raw.decode("utf-7") if isinstance(raw, bytes) else str(raw)
+                except Exception:
+                    line = str(raw)
+                # Exemplo: * LIST (\HasNoChildren \UnMarked \Sent) "." INBOX.Sent
+                if "\\Sent" in line:
+                    # nome da mailbox é o último token depois do separador
+                    mbox = line.split(' "', 1)[-1]
+                    # acima não é robusto pra todos; melhor pegar após o último espaço
+                    mbox = line.split(" ", maxsplit=3)[-1].strip()
+                    # remove aspas, se houver
+                    mbox = mbox.strip('"')
+                    _DETECTED_SENT_FOLDER = mbox
+                    log.info("Pasta \\Sent detectada: %s", _DETECTED_SENT_FOLDER)
+                    return _DETECTED_SENT_FOLDER
+    except Exception as e:
+        log.debug("Falha ao listar pastas para detectar \\Sent: %s", e)
+
+    _DETECTED_SENT_FOLDER = prefer
+    return _DETECTED_SENT_FOLDER
+
+def imap_append_sent_copy(imap, msg: EmailMessage):
+    try:
+        dest = imap_detect_sent_folder(imap)
+        imap_ensure_folder(imap, dest)
+        date_time = imaplib.Time2Internaldate(time.time())
+        # marca como lida na pasta de enviados
+        imap.append(dest, r"(\Seen)", date_time, msg.as_bytes())
+        log.info("Cópia da resposta salva em %s", dest)
+    except Exception as e:
+        log.warning("Não foi possível salvar cópia em enviados: %s", e)
+
+def smtp_send_reply(to_addr: str, subject: str, body_markdown: str,
+                    in_reply_to_msgid: str | None, original_msg,
+                    imap_for_copy=None) -> EmailMessage:
     from_addr = MAIL_USER
     if not from_addr:
         raise RuntimeError("MAIL_USER não definido")
@@ -355,17 +377,14 @@ def smtp_send_reply(to_addr: str, subject: str, body_markdown: str, in_reply_to_
     msg["Message-ID"] = make_msgid()
     if in_reply_to_msgid:
         msg["In-Reply-To"] = in_reply_to_msgid
-        # opcionalmente encadear References:
         refs = original_msg.get_all("References", [])
         if in_reply_to_msgid not in (refs or []):
             refs = (refs or []) + [in_reply_to_msgid]
         if refs:
             msg["References"] = " ".join(refs)
 
-    # enviamos como texto simples; se quiser HTML, aqui é onde converteria markdown -> html
     msg.set_content(full_body, subtype="plain", charset="utf-8")
 
-    context = None
     server = None
     try:
         if SMTP_TLS_MODE == "ssl":
@@ -380,6 +399,7 @@ def smtp_send_reply(to_addr: str, subject: str, body_markdown: str, in_reply_to_
                 server.ehlo()
         server.login(MAIL_USER, MAIL_PASS)
         server.send_message(msg)
+        log.info("Resposta enviada via SMTP para %s", to_addr)
     finally:
         try:
             if server:
@@ -387,36 +407,38 @@ def smtp_send_reply(to_addr: str, subject: str, body_markdown: str, in_reply_to_
         except Exception:
             pass
 
+    # salva cópia em Enviados pelo IMAP (na mesma sessão de leitura)
+    if SAVE_SENT_COPY and imap_for_copy is not None:
+        imap_append_sent_copy(imap_for_copy, msg)
+
+    return msg
+
 # -----------------------------
 # IMAP helpers
 # -----------------------------
 def imap_connect() -> imaplib.IMAP4_SSL:
     imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-    # Log capabilities pré-login
     try:
         typ, caps = imap.capability()
         if typ == "OK":
-            log.debug("CAPABILITIES: %s", " ".join(caps[0].decode().split()[2:]) if caps else "")
+            # Pre-login caps
+            caps_str = ""
+            try:
+                caps_str = " ".join(caps[0].decode().split()[2:]) if caps else ""
+            except Exception:
+                caps_str = str(caps)
+            log.debug("CAPABILITIES: %s", caps_str)
     except Exception:
         pass
-
     imap.login(MAIL_USER, MAIL_PASS)
     return imap
 
 def imap_select_inbox(imap):
     imap.select("INBOX")
 
-def imap_ensure_folder(imap, folder_name: str):
-    # Tenta criar; se já existir, ok
-    typ, _ = imap.create(folder_name)
-    # typ pode ser 'NO' se já existe; não é erro fatal
-    return
-
 def move_to_folder(imap, seq: bytes, folder_short: str):
     dest = ensure_inbox_prefix(folder_short)
-    # garante que a pasta existe
     imap_ensure_folder(imap, dest)
-    # copia e apaga
     imap.copy(seq, dest)
     imap.store(seq, "+FLAGS", r"(\Deleted)")
     if EXPUNGE_AFTER_COPY:
@@ -442,7 +464,6 @@ def process_unseen_once():
             return
 
         for seq in ids:
-            # Busca a mensagem
             typ, msgdata = imap.fetch(seq, "(BODY.PEEK[])")
             if typ != "OK" or not msgdata or not isinstance(msgdata[0], tuple):
                 log.warning("FETCH falhou para seq=%s", seq)
@@ -458,7 +479,6 @@ def process_unseen_once():
 
             body = get_msg_text(msg)
 
-            # Chama LLM para classificar
             decision_raw = classify_email_with_llm(subj, sender_disp, body)
             if decision_raw is None:
                 log.info("Decisão do modelo ausente → escalar por segurança.")
@@ -474,13 +494,18 @@ def process_unseen_once():
             acao, nivel, assunto_resp, corpo_md = parsed
             log.info("Decisão do modelo: acao=%s conf=%.2f", acao, nivel)
 
-            # Se responder com confiança >= limiar, envia; caso contrário, escalar
             if acao == "responder" and nivel >= RESPOND_THRESHOLD and corpo_md.strip():
                 try:
                     reply_to = from_addr
                     reply_subject = assunto_resp if assunto_resp else f"Re: {subj or ''}".strip()
-                    smtp_send_reply(reply_to, reply_subject, corpo_md, in_reply_to, msg)
-                    # move para Respondidos
+                    smtp_send_reply(
+                        reply_to,
+                        reply_subject,
+                        corpo_md,
+                        in_reply_to,
+                        msg,
+                        imap_for_copy=imap  # <<< salva cópia no Enviados
+                    )
                     move_to_folder(imap, seq, FOLDER_PROCESSED)
                     log.info("Resposta enviada e e-mail movido para INBOX.%s", FOLDER_PROCESSED)
                 except Exception as e:
@@ -535,7 +560,6 @@ def diag_or():
             {"role": "user", "content": "eco"},
         ]
         content = call_openrouter(messages)
-        # Não tentamos parsear; apenas retornamos corpo bruto e também uma eco JSON simples
         return jsonify({
             "ok": True,
             "model": OR_MODEL,
@@ -555,7 +579,6 @@ def start_background_thread():
     t.start()
 
 if __name__ == "__main__":
-    # Valida SMTP TLS x porta e avisa
     if SMTP_TLS_MODE == "ssl" and SMTP_PORT == 587:
         log.warning("SMTP_TLS_MODE=ssl com porta 587 — normalmente 587 requer STARTTLS. "
                     "Considere usar SMTP_TLS_MODE=starttls OU porta 465 com ssl.")
