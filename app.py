@@ -1,5 +1,5 @@
-#!/usr/bin/env python3 - v9.6 (atualizado indo para 9.7)
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3 - v9.6 (atualizado indo para 9.7 - mais um commit)
+# -*- coding: utf-8 -*- 
 
 """
 COBOL Support Agent — IMAP watcher + SMTP sender + OpenRouter
