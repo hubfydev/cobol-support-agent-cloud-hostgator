@@ -224,8 +224,8 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
         "top_p": 0,
         "response_format": {"type": "json_object"},  # força JSON
         "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "system", "content": system_prompt},  # apenas 1 system
+            {"role": "user", "content": user_prompt},      # e 1 user
         ],
     }
 
@@ -236,20 +236,51 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
         raise RuntimeError(f"OpenRouter HTTP {r.status_code}")
 
     data = r.json()
-    content = data["choices"][0]["message"]["content"]
-    # limpeza defensiva
-    content = (content or "").strip().strip("`")
+    content = (data.get("choices", [{}])[0].get("message", {}).get("content", "") or "")
+    content = content.strip().strip("`")
 
-    # tenta parse direto
+    # caminho feliz: já veio JSON limpo
     try:
         return json.loads(content)
     except Exception:
-        # tenta capturar o primeiro objeto JSON
-        m = re.search(r"\{(?:[^{}]|(?R))*\}", content)
-        if not m:
-            raise ValueError("Resposta do LLM sem JSON reconhecível.")
-        return json.loads(m.group(0))
+        pass
 
+    # fallback: extrair o primeiro objeto JSON balanceando chaves
+    def _first_json_object(s: str):
+        start = s.find("{")
+        while start != -1:
+            depth = 0
+            in_str = False
+            esc = False
+            for i in range(start, len(s)):
+                ch = s[i]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                else:
+                    if ch == '"':
+                        in_str = True
+                    elif ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            candidate = s[start:i+1]
+                            try:
+                                return json.loads(candidate)
+                            except Exception:
+                                break
+            start = s.find("{", start + 1)
+        return None
+
+    obj = _first_json_object(content)
+    if obj is None:
+        raise ValueError("Resposta do LLM sem JSON reconhecível.")
+    return obj
 
 # ==========================
 # Fluxo principal
