@@ -398,6 +398,7 @@ def send_email_reply(original_msg, to_addr: str, subject: str, body_text: str) -
     msg["To"] = to_addr
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain="aprendacobol.com.br")
 
     # threading headers
     orig_msgid = original_msg.get("Message-ID")
@@ -409,24 +410,29 @@ def send_email_reply(original_msg, to_addr: str, subject: str, body_text: str) -
 
     msg.set_content(body_text)
 
-    # Envio SMTP
+    def _send(smtp):
+        smtp.set_debuglevel(int(os.getenv("SMTP_DEBUG", "0")))
+        smtp.ehlo()
+        if SMTP_TLS_MODE == "starttls":
+            smtp.starttls(context=ssl.create_default_context())
+            smtp.ehlo()
+        smtp.login(MAIL_USER, MAIL_PASS)
+
+        # sendmail retorna dicionário de recusas por RCPT
+        refused = smtp.sendmail(MAIL_USER, [to_addr], msg.as_string())
+        if refused:
+            log.error("SMTP recusou destinatários: %s", refused)
+            raise RuntimeError(f"SMTP refused {refused}")
+
     if SMTP_TLS_MODE == "ssl":
-        context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context) as s:
-            s.set_debuglevel(SMTP_DEBUG)
-            s.login(MAIL_USER, MAIL_PASS)
-            s.send_message(msg)
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ssl.create_default_context()) as s:
+            _send(s)
     else:
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-            s.set_debuglevel(SMTP_DEBUG)
-            s.ehlo()
-            s.starttls(context=ssl.create_default_context())
-            s.ehlo()
-            s.login(MAIL_USER, MAIL_PASS)
-            s.send_message(msg)
+            _send(s)
 
     return msg.as_bytes()
-
+    
 def ensure_mailbox(imap: imaplib.IMAP4_SSL, box: str):
     try:
         imap.create(box)
