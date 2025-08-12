@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 - v9.8
+#!/usr/bin/env python3 - v9.9
 # -*- coding: utf-8 -*-
 
 """
@@ -46,6 +46,8 @@ FOLDER_PROCESSED = os.getenv("FOLDER_PROCESSED", "Respondidos")
 FOLDER_ESCALATE = os.getenv("FOLDER_ESCALATE", "Escalar")
 EXPUNGE_AFTER_COPY = os.getenv("EXPUNGE_AFTER_COPY", "true").lower() == "true"
 SENT_FOLDER = os.getenv("SENT_FOLDER", "INBOX.Sent")
+IMAP_FOLDER_INBOX = os.getenv("IMAP_FOLDER_INBOX", "INBOX")
+IMAP_FALLBACK_LAST_N = int(os.getenv("IMAP_FALLBACK_LAST_N", "0"))  # 0 = desliga
 
 # SMTP
 SMTP_HOST = os.getenv("SMTP_HOST")
@@ -379,7 +381,7 @@ def build_outgoing_body(corpo_markdown: str) -> str:
 def send_email_reply(original_msg, to_addr: str, subject: str, body_text: str) -> bytes:
     msg = EmailMessage()
     msg["From"] = MAIL_USER
-    msg["Sender"] = MAIL_USER  # ajuda na alinhamento com o domínio
+    msg["Sender"] = MAIL_USER  # ajuda no alinhamento com o domínio
     msg["To"] = to_addr
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
@@ -495,12 +497,28 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_seq: bytes, msg_bytes: bytes
 # ==========================
 # Watcher IMAP
 # ==========================
+def _imap_search_ids(imap, criteria: str):
+    typ, data = imap.search(None, criteria)
+    return data[0].split() if typ == "OK" and data and data[0] else []
+
+def _select_box(imap, box: str):
+    typ, data = imap.select(box)
+    if typ == "OK" and data:
+        try:
+            exists = int(data[0])
+        except Exception:
+            exists = data[0].decode() if isinstance(data[0], bytes) else data[0]
+        log.debug("SELECT %s → EXISTS=%s", box, exists)
+    else:
+        log.warning("Falha ao selecionar caixa %s: %s %s", box, typ, data)
+
 def watch_imap_loop():
     log.info("Watcher IMAP — envio via SMTP %s", SMTP_HOST)
     log.info("App público em: %s", APP_PUBLIC_URL)
     while True:
         try:
             with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
+                # Pré-login: capacidades
                 typ, caps = imap.capability()
                 if typ == "OK" and caps:
                     try:
@@ -508,20 +526,47 @@ def watch_imap_loop():
                     except Exception:
                         pass
 
+                # Login e seleção da caixa
                 imap.login(MAIL_USER, MAIL_PASS)
-                imap.select("INBOX")
+                _select_box(imap, IMAP_FOLDER_INBOX)
 
-                typ, data = imap.search(None, "UNSEEN")
-                unseen = data[0].split() if data and data[0] else []
-                log.debug("UNSEEN: %s", unseen)
+                # 1ª tentativa: UNSEEN
+                ids = _imap_search_ids(imap, "UNSEEN")
+                if not ids:
+                    # 2ª: NEW (não visto neste login)
+                    recent = _imap_search_ids(imap, "NEW")
+                    if recent:
+                        log.debug("NEW: %s", recent)
+                        ids = recent
 
-                for num in unseen:
+                if not ids:
+                    # 3ª: RECENT (mensagens recém-adicionadas)
+                    recent = _imap_search_ids(imap, "RECENT")
+                    if recent:
+                        log.debug("RECENT: %s", recent)
+                        ids = recent
+
+                if not ids and IMAP_FALLBACK_LAST_N > 0:
+                    # 4ª: últimos N da caixa (útil quando flags do provedor são inconsistentes)
+                    all_ids = _imap_search_ids(imap, "ALL")
+                    tail = all_ids[-IMAP_FALLBACK_LAST_N:] if all_ids else []
+                    if tail:
+                        log.warning(
+                            "UNSEEN/NEW/RECENT vazios — usando últimos %d IDs: %s",
+                            IMAP_FALLBACK_LAST_N, tail
+                        )
+                        ids = tail
+
+                log.debug("IDs a processar: %s", ids)
+
+                for num in ids:
                     typ, msg_data = imap.fetch(num, "(RFC822)")
-                    if typ != "OK":
+                    if typ != "OK" or not msg_data or not msg_data[0]:
                         continue
                     msg_bytes = msg_data[0][1]
                     decide_and_respond(imap, num, msg_bytes)
 
+                # limpeza opcional pós-processamento
                 if EXPUNGE_AFTER_COPY:
                     try:
                         imap.expunge()
@@ -586,6 +631,40 @@ def diag_smtp():
     except Exception as e:
         log.exception("Falha no /diag/smtp")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/diag/imap")
+def diag_imap():
+    """Mostra contagens UNSEEN/NEW/RECENT/ALL e últimos IDs. Parâmetros:
+       /diag/imap?box=INBOX&n=20
+    """
+    box = request.args.get("box", IMAP_FOLDER_INBOX)
+    n = int(request.args.get("n", "20"))
+    try:
+        with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
+            imap.login(MAIL_USER, MAIL_PASS)
+            _select_box(imap, box)
+
+            def _count(q):
+                ids = _imap_search_ids(imap, q)
+                # retorna só os últimos n IDs (legíveis)
+                tail = [i.decode() if isinstance(i, bytes) else i for i in ids[-n:]]
+                return len(ids), tail
+
+            c_unseen, ids_unseen = _count("UNSEEN")
+            c_new, ids_new = _count("NEW")
+            c_recent, ids_recent = _count("RECENT")
+            c_all, ids_all = _count("ALL")
+
+            imap.logout()
+
+        return jsonify({
+            "box": box,
+            "counts": {"UNSEEN": c_unseen, "NEW": c_new, "RECENT": c_recent, "ALL": c_all},
+            "tail_ids": {"UNSEEN": ids_unseen, "NEW": ids_new, "RECENT": ids_recent, "ALL": ids_all},
+        })
+    except Exception as e:
+        log.exception("diag/imap falhou")
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     import threading
