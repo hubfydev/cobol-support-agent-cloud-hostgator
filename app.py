@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 - v9.9
+#!/usr/bin/env python3 - v10.0
 # -*- coding: utf-8 -*-
 
 """
@@ -429,12 +429,11 @@ def ensure_mailbox(imap: imaplib.IMAP4_SSL, box: str):
     except Exception:
         log.debug("Mailbox pode já existir: %s", box)
 
-def move_message(imap: imaplib.IMAP4_SSL, msg_seq: bytes, dest_box: str):
+def move_message_uid(imap: imaplib.IMAP4_SSL, msg_uid: bytes, dest_box: str):
+    """Move por UID, sem EXPUNGE aqui (expunge acontece no fim do loop)."""
     ensure_mailbox(imap, dest_box)
-    imap.copy(msg_seq, dest_box)
-    if EXPUNGE_AFTER_COPY:
-        imap.store(msg_seq, "+FLAGS", r"(\Deleted)")
-        imap.expunge()
+    imap.uid("COPY", msg_uid, dest_box)
+    imap.uid("STORE", msg_uid, "+FLAGS", r"(\Deleted)")
 
 def append_to_sent(raw_bytes: bytes):
     with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
@@ -444,7 +443,7 @@ def append_to_sent(raw_bytes: bytes):
         imap.logout()
         log.info("Mensagem copiada para a pasta de enviados: %s", SENT_FOLDER)
 
-def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_seq: bytes, msg_bytes: bytes):
+def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_uid: bytes, msg_bytes: bytes):
     msg = BytesParser(policy=policy.default).parsebytes(msg_bytes)
     sender = decode_mime_words(msg.get("From"))
     from_addr = re.search(r"<([^>]+)>", sender)
@@ -460,10 +459,9 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_seq: bytes, msg_bytes: bytes
 
     try:
         llm_json = call_openrouter(SYSTEM_PROMPT, user_prompt)
-    except Exception as e:
-        log.error("LLM error")
-        log.exception(e)
-        move_message(imap, msg_seq, _safe_box(FOLDER_ESCALATE))
+    except Exception:
+        log.error("LLM error", exc_info=True)
+        move_message_uid(imap, msg_uid, _safe_box(FOLDER_ESCALATE))
         log.info("E-mail movido para %s", _safe_box(FOLDER_ESCALATE))
         return
 
@@ -475,7 +473,7 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_seq: bytes, msg_bytes: bytes
     should_answer = (acao == "responder") and (nivel >= CONFIDENCE_THRESHOLD)
 
     if not should_answer:
-        move_message(imap, msg_seq, _safe_box(FOLDER_ESCALATE))
+        move_message_uid(imap, msg_uid, _safe_box(FOLDER_ESCALATE))
         log.info("Decisão do modelo: acao=%s conf=%.2f → escalado", acao, nivel)
         return
 
@@ -491,14 +489,14 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_seq: bytes, msg_bytes: bytes
     except Exception:
         log.error("Falha ao copiar para enviados", exc_info=True)
 
-    move_message(imap, msg_seq, _safe_box(FOLDER_PROCESSED))
+    move_message_uid(imap, msg_uid, _safe_box(FOLDER_PROCESSED))
     log.info("E-mail movido para %s", _safe_box(FOLDER_PROCESSED))
 
 # ==========================
-# Watcher IMAP
+# Watcher IMAP (por UID)
 # ==========================
-def _imap_search_ids(imap, criteria: str):
-    typ, data = imap.search(None, criteria)
+def _imap_uid_search(imap, criteria: str):
+    typ, data = imap.uid("search", None, criteria)
     return data[0].split() if typ == "OK" and data and data[0] else []
 
 def _select_box(imap, box: str):
@@ -531,47 +529,54 @@ def watch_imap_loop():
                 _select_box(imap, IMAP_FOLDER_INBOX)
 
                 # 1ª tentativa: UNSEEN
-                ids = _imap_search_ids(imap, "UNSEEN")
-                if not ids:
+                uids = _imap_uid_search(imap, "UNSEEN")
+                if not uids:
                     # 2ª: NEW (não visto neste login)
-                    recent = _imap_search_ids(imap, "NEW")
+                    recent = _imap_uid_search(imap, "NEW")
                     if recent:
-                        log.debug("NEW: %s", recent)
-                        ids = recent
+                        log.debug("NEW (UIDs): %s", recent)
+                        uids = recent
 
-                if not ids:
+                if not uids:
                     # 3ª: RECENT (mensagens recém-adicionadas)
-                    recent = _imap_search_ids(imap, "RECENT")
+                    recent = _imap_uid_search(imap, "RECENT")
                     if recent:
-                        log.debug("RECENT: %s", recent)
-                        ids = recent
+                        log.debug("RECENT (UIDs): %s", recent)
+                        uids = recent
 
-                if not ids and IMAP_FALLBACK_LAST_N > 0:
-                    # 4ª: últimos N da caixa (útil quando flags do provedor são inconsistentes)
-                    all_ids = _imap_search_ids(imap, "ALL")
-                    tail = all_ids[-IMAP_FALLBACK_LAST_N:] if all_ids else []
+                if not uids and IMAP_FALLBACK_LAST_N > 0:
+                    # 4ª: últimos N (ALL) por UID
+                    all_uids = _imap_uid_search(imap, "ALL")
+                    tail = all_uids[-IMAP_FALLBACK_LAST_N:] if all_uids else []
                     if tail:
                         log.warning(
-                            "UNSEEN/NEW/RECENT vazios — usando últimos %d IDs: %s",
+                            "UNSEEN/NEW/RECENT vazios — usando últimos %d UIDs: %s",
                             IMAP_FALLBACK_LAST_N, tail
                         )
-                        ids = tail
+                        uids = tail
 
-                log.debug("IDs a processar: %s", ids)
+                log.debug("UIDs a processar: %s", uids)
 
-                for num in ids:
-                    typ, msg_data = imap.fetch(num, "(RFC822)")
-                    if typ != "OK" or not msg_data or not msg_data[0]:
+                # Processa do menor para o maior (ou poderia ser reverso)
+                for uid in uids:
+                    if not uid or not uid.strip():
                         continue
-                    msg_bytes = msg_data[0][1]
-                    decide_and_respond(imap, num, msg_bytes)
+                    try:
+                        typ, msg_data = imap.uid("fetch", uid, "(RFC822)")
+                        if typ != "OK" or not msg_data or not msg_data[0]:
+                            log.warning("Falha no FETCH UID=%s: %s %s", uid, typ, msg_data)
+                            continue
+                        msg_bytes = msg_data[0][1]
+                        decide_and_respond(imap, uid, msg_bytes)
+                    except Exception:
+                        log.exception("Erro ao processar UID=%s", uid)
 
-                # limpeza opcional pós-processamento
+                # limpeza opcional pós-processamento (expunge uma única vez)
                 if EXPUNGE_AFTER_COPY:
                     try:
                         imap.expunge()
                     except Exception:
-                        pass
+                        log.exception("Falha no expunge final")
 
                 imap.logout()
         except Exception:
@@ -634,7 +639,7 @@ def diag_smtp():
 
 @app.route("/diag/imap")
 def diag_imap():
-    """Mostra contagens UNSEEN/NEW/RECENT/ALL e últimos IDs. Parâmetros:
+    """Mostra contagens UNSEEN/NEW/RECENT/ALL e últimos UIDs. Parâmetros:
        /diag/imap?box=INBOX&n=20
     """
     box = request.args.get("box", IMAP_FOLDER_INBOX)
@@ -642,11 +647,12 @@ def diag_imap():
     try:
         with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
             imap.login(MAIL_USER, MAIL_PASS)
-            _select_box(imap, box)
+            typ, _ = imap.select(box)
+            if typ != "OK":
+                return jsonify({"error": f"não foi possível selecionar {box}"}), 500
 
             def _count(q):
-                ids = _imap_search_ids(imap, q)
-                # retorna só os últimos n IDs (legíveis)
+                ids = _imap_uid_search(imap, q)
                 tail = [i.decode() if isinstance(i, bytes) else i for i in ids[-n:]]
                 return len(ids), tail
 
@@ -660,7 +666,7 @@ def diag_imap():
         return jsonify({
             "box": box,
             "counts": {"UNSEEN": c_unseen, "NEW": c_new, "RECENT": c_recent, "ALL": c_all},
-            "tail_ids": {"UNSEEN": ids_unseen, "NEW": ids_new, "RECENT": ids_recent, "ALL": ids_all},
+            "tail_uids": {"UNSEEN": ids_unseen, "NEW": ids_new, "RECENT": ids_recent, "ALL": ids_all},
         })
     except Exception as e:
         log.exception("diag/imap falhou")
