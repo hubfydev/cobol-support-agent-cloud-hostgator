@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 - v10.0
+#!/usr/bin/env python3 - v10.1
 # -*- coding: utf-8 -*-
 
 """
@@ -65,6 +65,24 @@ OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "COBOL Support Agent")
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.8"))
 
+# --- LLM robustez extra ---
+LLM_COOLDOWN_SECONDS = int(os.getenv("LLM_COOLDOWN_SECONDS", "900"))  # 15 min
+LLM_DISABLE_ON_402 = os.getenv("LLM_DISABLE_ON_402", "true").lower() == "true"
+
+# Pré-triagem: pule LLM para remetentes/assuntos “operacionais”
+AUTO_ESCALATE_FROM_REGEX = os.getenv(
+    "AUTO_ESCALATE_FROM_REGEX",
+    r"(?i)(^mailer-daemon@|^postmaster@|^no[-_\. ]?reply@|^2fa@|^noreply@)"
+)
+AUTO_ESCALATE_SUBJECT_REGEX = os.getenv(
+    "AUTO_ESCALATE_SUBJECT_REGEX",
+    r"(?i)(verification code|delivery status|failure notice|bounce|sale made|refund|payment receipt|invoice)"
+)
+
+# Estado global simples do LLM
+_llm_block_until_ts = 0.0
+_last_llm_error = ""
+
 # App
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
 APP_PUBLIC_URL = os.getenv("APP_PUBLIC_URL", "")
@@ -118,6 +136,18 @@ log.info(
     "SYSTEM_PROMPT_SHA1=%s (primeiros 120 chars): %s",
     SYSTEM_PROMPT_SHA1[:12], SYSTEM_PROMPT[:120]
 )
+
+# ==========================
+# Helpers LLM
+# ==========================
+def _llm_is_blocked_now() -> bool:
+    return time.time() < _llm_block_until_ts
+
+def _llm_block(reason: str, seconds: int):
+    global _llm_block_until_ts, _last_llm_error
+    _last_llm_error = f"{reason} (cooldown {seconds}s)"
+    _llm_block_until_ts = time.time() + max(0, seconds)
+    log.warning("LLM bloqueado: %s", _last_llm_error)
 
 # ==========================
 # Utilitários de e-mail
@@ -221,6 +251,9 @@ def _post_openrouter(payload):
     )
 
 def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
+    if _llm_is_blocked_now():
+        raise RuntimeError("LLM temporarily disabled by cooldown")
+
     # 1) Tentativa com function-calling (mais confiável pra JSON)
     base_payload = {
         "model": OPENROUTER_MODEL,
@@ -256,8 +289,13 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
     r = _post_openrouter(base_payload)
     log.debug("OpenRouter status=%s", r.status_code)
 
-    # 2) Fallback de modelo/payload quando 402/404/429/500
-    if r.status_code in (402, 404, 429, 500):
+    # 402 → bloqueia imediatamente (saldo/rota indisponível)
+    if r.status_code == 402 and LLM_DISABLE_ON_402:
+        _llm_block("OpenRouter 402 (limite/rota indisponível)", LLM_COOLDOWN_SECONDS)
+        raise RuntimeError(f"OpenRouter HTTP {r.status_code}")
+
+    # 2) Fallback de modelo/payload quando 404/429/500
+    if r.status_code in (404, 429, 500):
         simple_payload = {
             "model": OPENROUTER_MODEL_FALLBACK,
             "max_tokens": OPENROUTER_MAX_TOKENS,
@@ -271,6 +309,9 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
         }
         r = _post_openrouter(simple_payload)
         log.debug("OpenRouter fallback status=%s", r.status_code)
+        if r.status_code == 402 and LLM_DISABLE_ON_402:
+            _llm_block("OpenRouter 402 no fallback", LLM_COOLDOWN_SECONDS)
+            raise RuntimeError(f"OpenRouter HTTP {r.status_code}")
 
     if r.status_code != 200:
         raise RuntimeError(f"OpenRouter HTTP {r.status_code}")
@@ -452,6 +493,19 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_uid: bytes, msg_bytes: bytes
     original_subject = decode_mime_words(msg.get("Subject"))
     body_text = extract_text_body(msg)
     cobol_files = extract_cobol_attachments(msg)
+
+    # --- PRE-TRIAGEM: pular LLM para remetentes/assuntos operacionais ---
+    try:
+        if AUTO_ESCALATE_FROM_REGEX and re.search(AUTO_ESCALATE_FROM_REGEX, (sender or ""), re.I):
+            move_message_uid(imap, msg_uid, _safe_box(FOLDER_ESCALATE))
+            log.info("Pré-triagem: remetente operacional → escalado (%s)", sender)
+            return
+        if AUTO_ESCALATE_SUBJECT_REGEX and re.search(AUTO_ESCALATE_SUBJECT_REGEX, (original_subject or ""), re.I):
+            move_message_uid(imap, msg_uid, _safe_box(FOLDER_ESCALATE))
+            log.info("Pré-triagem: assunto operacional → escalado ('%s')", original_subject)
+            return
+    except Exception:
+        log.debug("Pré-triagem ignorada (regex inválida?)", exc_info=True)
 
     log.debug("Email de %s / subj='%s' / anexos=%d", to_reply, original_subject, len(cobol_files))
 
@@ -671,6 +725,19 @@ def diag_imap():
     except Exception as e:
         log.exception("diag/imap falhou")
         return jsonify({"error": str(e)}), 500
+
+@app.route("/diag/llm")
+def diag_llm():
+    remaining = max(0, int(_llm_block_until_ts - time.time()))
+    return jsonify({
+        "blocked": _llm_is_blocked_now(),
+        "block_expires_in_seconds": remaining,
+        "last_error": _last_llm_error,
+        "model": OPENROUTER_MODEL,
+        "fallback": OPENROUTER_MODEL_FALLBACK,
+        "cooldown_seconds": LLM_COOLDOWN_SECONDS,
+        "disable_on_402": LLM_DISABLE_ON_402,
+    })
 
 if __name__ == "__main__":
     import threading
