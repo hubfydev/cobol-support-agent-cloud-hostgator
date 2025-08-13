@@ -1,12 +1,8 @@
-#!/usr/bin/env python3 - v10.1
+#!/usr/bin/env python3 - v10.2
 # -*- coding: utf-8 -*-
 
 """
 COBOL Support Agent — IMAP watcher + SMTP sender + OpenRouter
-- Lê INBOX por IMAP em polling
-- Classifica/gera ação via OpenRouter
-- Responde por SMTP OU move para INBOX.Escalar/INBOX.Respondidos
-- Exibe rotas / e /diag/* para health-check
 """
 
 import os
@@ -68,15 +64,16 @@ CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.8"))
 # --- LLM robustez extra ---
 LLM_COOLDOWN_SECONDS = int(os.getenv("LLM_COOLDOWN_SECONDS", "900"))  # 15 min
 LLM_DISABLE_ON_402 = os.getenv("LLM_DISABLE_ON_402", "true").lower() == "true"
+LLM_HARD_DISABLE = os.getenv("LLM_HARD_DISABLE", "false").lower() == "true"
 
 # Pré-triagem: pule LLM para remetentes/assuntos “operacionais”
 AUTO_ESCALATE_FROM_REGEX = os.getenv(
     "AUTO_ESCALATE_FROM_REGEX",
-    r"(?i)(^mailer-daemon@|^postmaster@|^no[-_\. ]?reply@|^2fa@|^noreply@)"
+    r"(?i)(^mailer-daemon@|^postmaster@|^no[-_\. ]?reply@|^2fa@|^noreply@|@hotmart\.com$)"
 )
 AUTO_ESCALATE_SUBJECT_REGEX = os.getenv(
     "AUTO_ESCALATE_SUBJECT_REGEX",
-    r"(?i)(verification code|delivery status|failure notice|bounce|sale made|refund|payment receipt|invoice)"
+    r"(?i)(verification code|delivery status|failure notice|bounce|sale made|refund|payment|invoice|assinatura|pagamento atrasado|chargeback)"
 )
 
 # Estado global simples do LLM
@@ -99,12 +96,11 @@ SIGNATURE_FOOTER = os.getenv(
         "JCL, Db2 e Bancos de Dados completo em:"
     ),
 )
-# Normaliza '\n' literais vindos da env var
 SIGNATURE_FOOTER = SIGNATURE_FOOTER.replace("\\n", "\n")
 SIGNATURE_LINKS = os.getenv("SIGNATURE_LINKS", "https://aprendacobol.com.br/assinatura/")
 
 # ==========================
-# Prompt do sistema (com CTAs obrigatórios)
+# Prompt do sistema
 # ==========================
 SYSTEM_PROMPT = (
     "Você é um assistente de suporte de um curso de COBOL. "
@@ -130,18 +126,14 @@ SYSTEM_PROMPT = (
     "- Conheça a Formação Completa de Programador COBOL: https://assinatura.aprendacobol.com.br "
 )
 
-# sha1 do prompt para diagnóstico
 SYSTEM_PROMPT_SHA1 = hashlib.sha1(SYSTEM_PROMPT.encode("utf-8")).hexdigest()
-log.info(
-    "SYSTEM_PROMPT_SHA1=%s (primeiros 120 chars): %s",
-    SYSTEM_PROMPT_SHA1[:12], SYSTEM_PROMPT[:120]
-)
+log.info("SYSTEM_PROMPT_SHA1=%s (primeiros 120 chars): %s", SYSTEM_PROMPT_SHA1[:12], SYSTEM_PROMPT[:120])
 
 # ==========================
 # Helpers LLM
 # ==========================
 def _llm_is_blocked_now() -> bool:
-    return time.time() < _llm_block_until_ts
+    return LLM_HARD_DISABLE or (time.time() < _llm_block_until_ts)
 
 def _llm_block(reason: str, seconds: int):
     global _llm_block_until_ts, _last_llm_error
@@ -166,9 +158,7 @@ def decode_mime_words(s):
         return s
 
 def extract_text_body(msg):
-    # Prioriza text/plain; se não houver, converte text/html para texto
-    text_parts = []
-    html_parts = []
+    text_parts, html_parts = [], []
     if msg.is_multipart():
         for part in msg.walk():
             ctype = part.get_content_type()
@@ -199,7 +189,6 @@ def extract_text_body(msg):
     if text_parts:
         return "\n\n".join(t.strip() for t in text_parts if t)
 
-    # fallback simples de HTML->texto
     if html_parts:
         html = "\n\n".join(html_parts)
         text = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
@@ -243,18 +232,18 @@ def _post_openrouter(payload):
         "HTTP-Referer": OPENROUTER_SITE_URL or APP_PUBLIC_URL or "",
         "X-Title": OPENROUTER_APP_NAME,
     }
+    # timeout mais curto evita travamentos quando a rota está ruim
     return requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers=headers,
         data=json.dumps(payload),
-        timeout=60,
+        timeout=30,
     )
 
 def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
     if _llm_is_blocked_now():
-        raise RuntimeError("LLM temporarily disabled by cooldown")
+        raise RuntimeError("LLM temporarily disabled by cooldown / hard-disable")
 
-    # 1) Tentativa com function-calling (mais confiável pra JSON)
     base_payload = {
         "model": OPENROUTER_MODEL,
         "max_tokens": OPENROUTER_MAX_TOKENS,
@@ -289,12 +278,12 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
     r = _post_openrouter(base_payload)
     log.debug("OpenRouter status=%s", r.status_code)
 
-    # 402 → bloqueia imediatamente (saldo/rota indisponível)
+    # 402 → bloqueia imediatamente (sem fallback)
     if r.status_code == 402 and LLM_DISABLE_ON_402:
         _llm_block("OpenRouter 402 (limite/rota indisponível)", LLM_COOLDOWN_SECONDS)
         raise RuntimeError(f"OpenRouter HTTP {r.status_code}")
 
-    # 2) Fallback de modelo/payload quando 404/429/500
+    # Fallback só para 404/429/500
     if r.status_code in (404, 429, 500):
         simple_payload = {
             "model": OPENROUTER_MODEL_FALLBACK,
@@ -320,7 +309,6 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
 
-    # 3) Caminho feliz: tool_calls
     tool_calls = message.get("tool_calls") or []
     if tool_calls:
         try:
@@ -329,7 +317,6 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
         except Exception as e:
             log.debug("Falha ao parsear tool_call.arguments: %s", e)
 
-    # 4) Conteúdo “normal”
     content = (message.get("content") or "").strip()
     log.debug("LLM raw content (primeiros 400 chars): %s", content[:400])
 
@@ -392,12 +379,10 @@ def build_user_prompt(original_subject: str, body_text: str, cobol_files: list) 
     parts = []
     parts.append(f"Assunto original: {original_subject}")
     parts.append("\nCorpo do e-mail do aluno:\n" + (body_text or "(vazio)"))
-
     if cobol_files:
         parts.append("\nAnexos COBOL (até 80KB cada, apenas resumo):")
         for (fn, snip) in cobol_files:
             parts.append(f"--- {fn} ---\n{snip}\n")
-
     parts.append(
         "\nSua tarefa: decida se dá para responder ou se deve escalar. "
         "Se der para responder, produza resposta objetiva e educada, com observações sobre o código COBOL quando houver. "
@@ -422,14 +407,13 @@ def build_outgoing_body(corpo_markdown: str) -> str:
 def send_email_reply(original_msg, to_addr: str, subject: str, body_text: str) -> bytes:
     msg = EmailMessage()
     msg["From"] = MAIL_USER
-    msg["Sender"] = MAIL_USER  # ajuda no alinhamento com o domínio
+    msg["Sender"] = MAIL_USER
     msg["To"] = to_addr
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain=(MAIL_USER.split("@", 1)[-1] if MAIL_USER and "@" in MAIL_USER else None))
     msg["X-Mailer"] = "COBOL Support Agent"
 
-    # threading headers (se houver original)
     if original_msg:
         try:
             orig_msgid = original_msg.get("Message-ID")
@@ -471,7 +455,6 @@ def ensure_mailbox(imap: imaplib.IMAP4_SSL, box: str):
         log.debug("Mailbox pode já existir: %s", box)
 
 def move_message_uid(imap: imaplib.IMAP4_SSL, msg_uid: bytes, dest_box: str):
-    """Move por UID, sem EXPUNGE aqui (expunge acontece no fim do loop)."""
     ensure_mailbox(imap, dest_box)
     imap.uid("COPY", msg_uid, dest_box)
     imap.uid("STORE", msg_uid, "+FLAGS", r"(\Deleted)")
@@ -480,7 +463,7 @@ def append_to_sent(raw_bytes: bytes):
     with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
         imap.login(MAIL_USER, MAIL_PASS)
         ensure_mailbox(imap, SENT_FOLDER)
-        imap.append(SENT_FOLDER, r"(\Seen)", None, raw_bytes)  # deixa o servidor definir a data
+        imap.append(SENT_FOLDER, r"(\Seen)", None, raw_bytes)
         imap.logout()
         log.info("Mensagem copiada para a pasta de enviados: %s", SENT_FOLDER)
 
@@ -494,7 +477,7 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_uid: bytes, msg_bytes: bytes
     body_text = extract_text_body(msg)
     cobol_files = extract_cobol_attachments(msg)
 
-    # --- PRE-TRIAGEM: pular LLM para remetentes/assuntos operacionais ---
+    # PRE-TRIAGEM (regex)
     try:
         if AUTO_ESCALATE_FROM_REGEX and re.search(AUTO_ESCALATE_FROM_REGEX, (sender or ""), re.I):
             move_message_uid(imap, msg_uid, _safe_box(FOLDER_ESCALATE))
@@ -507,8 +490,15 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_uid: bytes, msg_bytes: bytes
     except Exception:
         log.debug("Pré-triagem ignorada (regex inválida?)", exc_info=True)
 
-    log.debug("Email de %s / subj='%s' / anexos=%d", to_reply, original_subject, len(cobol_files))
+    # CURTO-CIRCUITO: LLM bloqueado
+    if _llm_is_blocked_now():
+        remaining = max(0, int(_llm_block_until_ts - time.time())) if not LLM_HARD_DISABLE else -1
+        log.warning("LLM em cooldown/hard-disable (%ss). Pulando LLM e escalando. De: %s Assunto: %s",
+                    remaining, sender, original_subject)
+        move_message_uid(imap, msg_uid, _safe_box(FOLDER_ESCALATE))
+        return
 
+    log.debug("Email de %s / subj='%s' / anexos=%d", to_reply, original_subject, len(cobol_files))
     user_prompt = build_user_prompt(original_subject, body_text, cobol_files)
 
     try:
@@ -570,7 +560,6 @@ def watch_imap_loop():
     while True:
         try:
             with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
-                # Pré-login: capacidades
                 typ, caps = imap.capability()
                 if typ == "OK" and caps:
                     try:
@@ -578,28 +567,23 @@ def watch_imap_loop():
                     except Exception:
                         pass
 
-                # Login e seleção da caixa
                 imap.login(MAIL_USER, MAIL_PASS)
                 _select_box(imap, IMAP_FOLDER_INBOX)
 
-                # 1ª tentativa: UNSEEN
                 uids = _imap_uid_search(imap, "UNSEEN")
                 if not uids:
-                    # 2ª: NEW (não visto neste login)
                     recent = _imap_uid_search(imap, "NEW")
                     if recent:
                         log.debug("NEW (UIDs): %s", recent)
                         uids = recent
 
                 if not uids:
-                    # 3ª: RECENT (mensagens recém-adicionadas)
                     recent = _imap_uid_search(imap, "RECENT")
                     if recent:
                         log.debug("RECENT (UIDs): %s", recent)
                         uids = recent
 
                 if not uids and IMAP_FALLBACK_LAST_N > 0:
-                    # 4ª: últimos N (ALL) por UID
                     all_uids = _imap_uid_search(imap, "ALL")
                     tail = all_uids[-IMAP_FALLBACK_LAST_N:] if all_uids else []
                     if tail:
@@ -611,7 +595,6 @@ def watch_imap_loop():
 
                 log.debug("UIDs a processar: %s", uids)
 
-                # Processa do menor para o maior (ou poderia ser reverso)
                 for uid in uids:
                     if not uid or not uid.strip():
                         continue
@@ -625,7 +608,6 @@ def watch_imap_loop():
                     except Exception:
                         log.exception("Erro ao processar UID=%s", uid)
 
-                # limpeza opcional pós-processamento (expunge uma única vez)
                 if EXPUNGE_AFTER_COPY:
                     try:
                         imap.expunge()
@@ -653,6 +635,18 @@ def diag_prompt():
         "first120": SYSTEM_PROMPT[:120],
     })
 
+def _post_openrouter_diag(payload):
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": OPENROUTER_SITE_URL or APP_PUBLIC_URL or "",
+        "X-Title": OPENROUTER_APP_NAME,
+    }
+    return requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=headers, data=json.dumps(payload), timeout=20
+    )
+
 @app.route("/diag/openrouter-chat")
 def diag_openrouter():
     try:
@@ -667,7 +661,7 @@ def diag_openrouter():
                 {"role": "user", "content": "Retorne {\"ok\": true}."},
             ],
         }
-        r = _post_openrouter(payload)
+        r = _post_openrouter_diag(payload)
         status = r.status_code
         try:
             body = r.json()
@@ -679,7 +673,6 @@ def diag_openrouter():
 
 @app.route("/diag/smtp")
 def diag_smtp():
-    """Envia um e-mail de teste simples: /diag/smtp?to=dest@exemplo.com"""
     to = request.args.get("to", MAIL_USER)
     subject = "Teste SMTP — COBOL Support Agent"
     body = "Olá! Este é um teste de envio SMTP direto do /diag/smtp.\n\n— Sistema"
@@ -693,9 +686,6 @@ def diag_smtp():
 
 @app.route("/diag/imap")
 def diag_imap():
-    """Mostra contagens UNSEEN/NEW/RECENT/ALL e últimos UIDs. Parâmetros:
-       /diag/imap?box=INBOX&n=20
-    """
     box = request.args.get("box", IMAP_FOLDER_INBOX)
     n = int(request.args.get("n", "20"))
     try:
@@ -731,7 +721,8 @@ def diag_llm():
     remaining = max(0, int(_llm_block_until_ts - time.time()))
     return jsonify({
         "blocked": _llm_is_blocked_now(),
-        "block_expires_in_seconds": remaining,
+        "block_expires_in_seconds": remaining if not LLM_HARD_DISABLE else None,
+        "hard_disable": LLM_HARD_DISABLE,
         "last_error": _last_llm_error,
         "model": OPENROUTER_MODEL,
         "fallback": OPENROUTER_MODEL_FALLBACK,
