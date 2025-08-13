@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 - v10.4
+#!/usr/bin/env python3 - v10.5
 # -*- coding: utf-8 -*-
 
 """
@@ -668,6 +668,14 @@ def diag_prompt():
         "sha1": SYSTEM_PROMPT_SHA1,
         "first120": SYSTEM_PROMPT[:120],
     })
+
+# Adicione perto das outras rotas /diag/*
+@app.route("/diag/llm/unblock", methods=["POST"])
+def diag_llm_unblock():
+    global _llm_block_until_ts, _last_llm_error
+    _llm_block_until_ts = 0.0
+    _last_llm_error = ""
+    return jsonify({"ok": True, "unblocked": True})
 
 def _post_openrouter_diag(payload):
     headers = {
