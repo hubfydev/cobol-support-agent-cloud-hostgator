@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 - v10.5
+#!/usr/bin/env python3 - v10.6
 # -*- coding: utf-8 -*-
 
 """
@@ -251,58 +251,66 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
     if _llm_is_blocked_now():
         raise RuntimeError("LLM temporarily disabled by cooldown / hard-disable")
 
-    base_payload = {
-        "model": OPENROUTER_MODEL,
-        "max_tokens": OPENROUTER_MAX_TOKENS,
-        "temperature": 0.0,
-        "top_p": 0,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "compose_email",
-                "description": "Retorne somente os campos exigidos no esquema.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "assunto": {"type": "string"},
-                        "corpo_markdown": {"type": "string"},
-                        "nivel_confianca": {"type": "number"},
-                        "acao": {"type": "string", "enum": ["responder", "escalar"]}
-                    },
-                    "required": ["assunto", "corpo_markdown", "nivel_confianca", "acao"],
-                    "additionalProperties": False
-                }
-            }
-        }],
-        "tool_choice": "required",
-    }
-
-    r = _post_openrouter(base_payload)
-    log.debug("OpenRouter status=%s", r.status_code)
-
-    # 402 → bloqueia imediatamente (sem fallback)
-    if r.status_code == 402 and LLM_DISABLE_ON_402:
-        _llm_block("OpenRouter 402 (limite/rota indisponível)", LLM_COOLDOWN_SECONDS)
-        raise RuntimeError(f"OpenRouter HTTP {r.status_code}")
-
-    # Fallback só para 404/429/500
-    if r.status_code in (404, 429, 500):
-        simple_payload = {
-            "model": OPENROUTER_MODEL_FALLBACK,
+    def _make_payload(compat: bool):
+        p = {
+            "model": OPENROUTER_MODEL,
             "max_tokens": OPENROUTER_MAX_TOKENS,
             "temperature": 0.0,
-            "top_p": 0,
-            "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
         }
+        # modo “rico” (preferido)
+        if not compat:
+            p["tools"] = [{
+                "type": "function",
+                "function": {
+                    "name": "compose_email",
+                    "description": "Retorne somente os campos exigidos no esquema.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "assunto": {"type": "string"},
+                            "corpo_markdown": {"type": "string"},
+                            "nivel_confianca": {"type": "number"},
+                            "acao": {"type": "string", "enum": ["responder", "escalar"]}
+                        },
+                        "required": ["assunto", "corpo_markdown", "nivel_confianca", "acao"],
+                        "additionalProperties": False
+                    }
+                }
+            }]
+            p["tool_choice"] = "required"
+            p["response_format"] = {"type": "json_object"}
+            # evite top_p=0 em provedores que rejeitam 0: comente a linha abaixo se preferir não enviar top_p
+            # p["top_p"] = 0
+        return p
+
+    # 1) tenta com tools/json_mode
+    payload = _make_payload(compat=False)
+    r = _post_openrouter(payload)
+    log.debug("OpenRouter status=%s", r.status_code)
+
+    # 402 → cooldown (já implementado no seu código)
+    if r.status_code == 402 and LLM_DISABLE_ON_402:
+        _llm_block("OpenRouter 402 (limite/rota indisponível)", LLM_COOLDOWN_SECONDS)
+        raise RuntimeError(f"OpenRouter HTTP {r.status_code}")
+
+    # 400 → refaz em modo compatível (sem tools/response_format/top_p)
+    if r.status_code == 400:
+        try:
+            log.error("OpenRouter 400 body (primeiros 500 chars): %s", r.text[:500])
+        except Exception:
+            pass
+        compat_payload = _make_payload(compat=True)
+        r = _post_openrouter(compat_payload)
+        log.debug("OpenRouter (compat) status=%s", r.status_code)
+
+    # Fallback só para 404/429/500
+    if r.status_code in (404, 429, 500):
+        simple_payload = _make_payload(compat=True)
+        simple_payload["model"] = OPENROUTER_MODEL_FALLBACK
         r = _post_openrouter(simple_payload)
         log.debug("OpenRouter fallback status=%s", r.status_code)
         if r.status_code == 402 and LLM_DISABLE_ON_402:
@@ -310,12 +318,17 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
             raise RuntimeError(f"OpenRouter HTTP {r.status_code}")
 
     if r.status_code != 200:
+        try:
+            log.error("OpenRouter erro %s, corpo: %s", r.status_code, r.text[:500])
+        except Exception:
+            pass
         raise RuntimeError(f"OpenRouter HTTP {r.status_code}")
 
     data = r.json()
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
 
+    # caminho 1: function-calling
     tool_calls = message.get("tool_calls") or []
     if tool_calls:
         try:
@@ -324,6 +337,7 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
         except Exception as e:
             log.debug("Falha ao parsear tool_call.arguments: %s", e)
 
+    # caminho 2: conteúdo normal → extrai 1º objeto JSON
     content = (message.get("content") or "").strip()
     log.debug("LLM raw content (primeiros 400 chars): %s", content[:400])
 
