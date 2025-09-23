@@ -6,8 +6,9 @@ COBOL Support Agent — IMAP watcher + SMTP sender + OpenRouter
 – v10.10:
   * SMTP: fallback + cooldown; em falha, mover para Escalar.
   * LLM: captura robusta de erros de rede (requests/ChunkedEncoding/Resets) e escala.
-  * IMAP: FETCH seguro (sem IndexError) e proteção adicional no loop.
+  * IMAP: FETCH seguro (sem IndexError) e proteção adicional no loop. 
 """
+
 
 import os
 import re
