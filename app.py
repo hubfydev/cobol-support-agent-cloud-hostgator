@@ -1,12 +1,12 @@
-#!/usr/bin/env python3 - v10.9
+#!/usr/bin/env python3 - v10.10
 # -*- coding: utf-8 -*-
 
 """
 COBOL Support Agent — IMAP watcher + SMTP sender + OpenRouter
-– v10.9:
-  * SMTP robusto com fallback + cooldown para evitar “loop” quando o servidor não responde.
-  * Tratamento seguro do FETCH IMAP para evitar IndexError.
-  * Em falha de envio, mover para pasta de Escala/Escalonamento (sem reprocessar).
+– v10.10:
+  * SMTP: fallback + cooldown; em falha, mover para Escalar.
+  * LLM: captura robusta de erros de rede (requests/ChunkedEncoding/Resets) e escala.
+  * IMAP: FETCH seguro (sem IndexError) e proteção adicional no loop.
 """
 
 import os
@@ -51,8 +51,6 @@ EXPUNGE_AFTER_COPY = os.getenv("EXPUNGE_AFTER_COPY", "true").lower() == "true"
 SENT_FOLDER = os.getenv("SENT_FOLDER", "INBOX.Sent")
 IMAP_FOLDER_INBOX = os.getenv("IMAP_FOLDER_INBOX", "INBOX")
 IMAP_FALLBACK_LAST_N = int(os.getenv("IMAP_FALLBACK_LAST_N", "0"))  # 0 = desliga
-
-# >>> CONTROLES DE BUSCA IMAP <<<
 IMAP_STRICT_UNSEEN_ONLY = os.getenv("IMAP_STRICT_UNSEEN_ONLY", "true").lower() == "true"
 IMAP_SINCE_DAYS = int(os.getenv("IMAP_SINCE_DAYS", "0"))
 IMAP_FALLBACK_WHEN_LLM_BLOCKED = os.getenv("IMAP_FALLBACK_WHEN_LLM_BLOCKED", "false").lower() == "true"
@@ -62,11 +60,11 @@ SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_TLS_MODE = os.getenv("SMTP_TLS_MODE", "starttls").lower()  # starttls|ssl
 SMTP_DEBUG = int(os.getenv("SMTP_DEBUG", "0"))
-SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", "20"))  # segundos
-SMTP_FALLBACKS = os.getenv("SMTP_FALLBACKS", "587:starttls,465:ssl,2525:starttls")
+SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", "12"))
+SMTP_FALLBACKS = os.getenv("SMTP_FALLBACKS", "465:ssl,2525:starttls")
 
-# Cooldown de SMTP para evitar loop quando a rede/servidor estão bloqueando
-SMTP_COOLDOWN_SECONDS = int(os.getenv("SMTP_COOLDOWN_SECONDS", "600"))
+# SMTP cooldown para evitar loop
+SMTP_COOLDOWN_SECONDS = int(os.getenv("SMTP_COOLDOWN_SECONDS", "900"))
 _smtp_block_until_ts = 0.0
 _last_smtp_error = ""
 
@@ -87,24 +85,13 @@ OPENROUTER_MODEL_FALLBACK = os.getenv("OPENROUTER_MODEL_FALLBACK", "openrouter/a
 OPENROUTER_MAX_TOKENS = int(os.getenv("OPENROUTER_MAX_TOKENS", "512"))
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "COBOL Support Agent")
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
+OPENROUTER_TIMEOUT = int(os.getenv("OPENROUTER_TIMEOUT", "30"))
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.8"))
 
-# --- LLM robustez extra ---
+# LLM robustez extra
 LLM_COOLDOWN_SECONDS = int(os.getenv("LLM_COOLDOWN_SECONDS", "900"))  # 15 min
 LLM_DISABLE_ON_402 = os.getenv("LLM_DISABLE_ON_402", "true").lower() == "true"
 LLM_HARD_DISABLE = os.getenv("LLM_HARD_DISABLE", "false").lower() == "true"
-
-# Pré-triagem (regex para pular LLM)
-AUTO_ESCALATE_FROM_REGEX = os.getenv(
-    "AUTO_ESCALATE_FROM_REGEX",
-    r"(?i)(^mailer-daemon@|^postmaster@|^no[-_\. ]?reply@|^2fa@|^noreply@|@hotmart\.com$)"
-)
-AUTO_ESCALATE_SUBJECT_REGEX = os.getenv(
-    "AUTO_ESCALATE_SUBJECT_REGEX",
-    r"(?i)(verification code|delivery status|failure notice|bounce|sale made|refund|payment|invoice|assinatura|pagamento atrasado|chargeback)"
-)
-
-# Estado global simples do LLM
 _llm_block_until_ts = 0.0
 _last_llm_error = ""
 
@@ -123,8 +110,7 @@ SIGNATURE_FOOTER = os.getenv(
         "Conheça nossa Formação Completa de Programadores COBOL, com COBOL Avançado,\n"
         "JCL, Db2 e Bancos de Dados completo em:"
     ),
-)
-SIGNATURE_FOOTER = SIGNATURE_FOOTER.replace("\\n", "\n")
+).replace("\\n", "\n")
 SIGNATURE_LINKS = os.getenv("SIGNATURE_LINKS", "https://aprendacobol.com.br/assinatura/")
 
 # ==========================
@@ -154,7 +140,6 @@ SYSTEM_PROMPT = (
     "- Nossa Comunidade no Telegram: https://t.me/aprendacobol "
     "- Conheça a Formação Completa de Programador COBOL: https://assinatura.aprendacobol.com.br "
 )
-
 SYSTEM_PROMPT_SHA1 = hashlib.sha1(SYSTEM_PROMPT.encode("utf-8")).hexdigest()
 log.info("SYSTEM_PROMPT_SHA1=%s (primeiros 120 chars): %s", SYSTEM_PROMPT_SHA1[:12], SYSTEM_PROMPT[:120])
 
@@ -193,27 +178,19 @@ def extract_text_body(msg):
             ctype = part.get_content_type()
             disp = (part.get("Content-Disposition") or "").lower()
             if ctype == "text/plain" and "attachment" not in disp:
-                try:
-                    text_parts.append(part.get_content())
-                except Exception:
-                    pass
+                try: text_parts.append(part.get_content())
+                except Exception: pass
             elif ctype == "text/html" and "attachment" not in disp:
-                try:
-                    html_parts.append(part.get_content())
-                except Exception:
-                    pass
+                try: html_parts.append(part.get_content())
+                except Exception: pass
     else:
         ctype = msg.get_content_type()
         if ctype == "text/plain":
-            try:
-                text_parts.append(msg.get_content())
-            except Exception:
-                pass
+            try: text_parts.append(msg.get_content())
+            except Exception: pass
         elif ctype == "text/html":
-            try:
-                html_parts.append(msg.get_content())
-            except Exception:
-                pass
+            try: html_parts.append(msg.get_content())
+            except Exception: pass
 
     if text_parts:
         return "\n\n".join(t.strip() for t in text_parts if t)
@@ -233,16 +210,13 @@ def extract_cobol_attachments(msg, max_bytes=80_000):
         for part in msg.walk():
             disp = (part.get("Content-Disposition") or "").lower()
             if "attachment" in disp:
-                filename = part.get_filename()
-                filename = decode_mime_words(filename)
-                if not filename:
-                    continue
+                filename = decode_mime_words(part.get_filename())
+                if not filename: continue
                 lower = filename.lower()
                 if lower.endswith((".cob", ".cbl", ".cpy")):
                     try:
                         data = part.get_payload(decode=True)
-                        if not data:
-                            continue
+                        if not data: continue
                         snippet = data[:max_bytes].decode("utf-8", errors="replace")
                         cobol_files.append((filename, snippet))
                     except Exception:
@@ -253,6 +227,7 @@ def extract_cobol_attachments(msg, max_bytes=80_000):
 # OpenRouter client
 # ==========================
 import requests
+from requests.exceptions import RequestException, ChunkedEncodingError
 
 def _post_openrouter(payload):
     headers = {
@@ -261,11 +236,12 @@ def _post_openrouter(payload):
         "HTTP-Referer": OPENROUTER_SITE_URL or APP_PUBLIC_URL or "",
         "X-Title": OPENROUTER_APP_NAME,
     }
+    # timeout curto o suficiente para não travar
     return requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers=headers,
         data=json.dumps(payload),
-        timeout=30,
+        timeout=OPENROUTER_TIMEOUT,
     )
 
 def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
@@ -305,7 +281,12 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
             p["response_format"] = {"type": "json_object"}
         return p
 
-    r = _post_openrouter(_make_payload(compat=False))
+    try:
+        r = _post_openrouter(_make_payload(compat=False))
+    except (RequestException, ChunkedEncodingError, ConnectionError) as e:
+        _llm_block(f"OpenRouter network error: {e}", LLM_COOLDOWN_SECONDS)
+        raise RuntimeError("OpenRouter network error")
+
     log.debug("OpenRouter status=%s", r.status_code)
 
     if r.status_code == 402 and LLM_DISABLE_ON_402:
@@ -317,13 +298,21 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
             log.error("OpenRouter 400 body (primeiros 500 chars): %s", r.text[:500])
         except Exception:
             pass
-        r = _post_openrouter(_make_payload(compat=True))
+        try:
+            r = _post_openrouter(_make_payload(compat=True))
+        except (RequestException, ChunkedEncodingError, ConnectionError) as e:
+            _llm_block(f"OpenRouter network error (compat): {e}", LLM_COOLDOWN_SECONDS)
+            raise RuntimeError("OpenRouter network error (compat)")
         log.debug("OpenRouter (compat) status=%s", r.status_code)
 
     if r.status_code in (404, 429, 500):
         payload = _make_payload(compat=True)
         payload["model"] = OPENROUTER_MODEL_FALLBACK
-        r = _post_openrouter(payload)
+        try:
+            r = _post_openrouter(payload)
+        except (RequestException, ChunkedEncodingError, ConnectionError) as e:
+            _llm_block(f"OpenRouter network error (fallback): {e}", LLM_COOLDOWN_SECONDS)
+            raise RuntimeError("OpenRouter network error (fallback)")
         log.debug("OpenRouter fallback status=%s", r.status_code)
         if r.status_code == 402 and LLM_DISABLE_ON_402:
             _llm_block("OpenRouter 402 no fallback", LLM_COOLDOWN_SECONDS)
@@ -336,7 +325,12 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
             pass
         raise RuntimeError(f"OpenRouter HTTP {r.status_code}")
 
-    data = r.json()
+    try:
+        data = r.json()
+    except Exception as e:
+        _llm_block(f"OpenRouter JSON parse error: {e}", LLM_COOLDOWN_SECONDS)
+        raise RuntimeError("OpenRouter JSON parse error")
+
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
 
@@ -367,17 +361,12 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
             for i in range(start, len(s)):
                 ch = s[i]
                 if in_str:
-                    if esc:
-                        esc = False
-                    elif ch == "\\":
-                        esc = True
-                    elif ch == '"':
-                        in_str = False
+                    if esc: esc = False
+                    elif ch == "\\": esc = True
+                    elif ch == '"': in_str = False
                 else:
-                    if ch == '"':
-                        in_str = True
-                    elif ch == "{":
-                        depth += 1
+                    if ch == '"': in_str = True
+                    elif ch == "{": depth += 1
                     elif ch == "}":
                         depth -= 1
                         if depth == 0:
@@ -403,12 +392,10 @@ def _smtp_connect_with_fallback():
         remaining = int(_smtp_block_until_ts - time.time())
         raise RuntimeError(f"SMTP em cooldown ({remaining}s) — pulando envio")
 
-    attempts = []
-    attempts.append((SMTP_TLS_MODE, SMTP_HOST, SMTP_PORT))
+    attempts = [(SMTP_TLS_MODE, SMTP_HOST, SMTP_PORT)]
     for item in (SMTP_FALLBACKS or "").split(","):
         item = item.strip()
-        if not item:
-            continue
+        if not item: continue
         try:
             port_str, mode = item.split(":", 1)
             port = int(port_str)
@@ -426,29 +413,22 @@ def _smtp_connect_with_fallback():
             log.info("[SMTP] tentando %s:%s (%s)", host, port, mode)
             if mode == "ssl":
                 s = smtplib.SMTP_SSL(host, port, timeout=SMTP_TIMEOUT, context=ctx)
-                s.set_debuglevel(SMTP_DEBUG)
-                s.ehlo()
+                s.set_debuglevel(SMTP_DEBUG); s.ehlo()
             else:
                 s = smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT)
-                s.set_debuglevel(SMTP_DEBUG)
-                s.ehlo()
-                s.starttls(context=ctx)
-                s.ehlo()
+                s.set_debuglevel(SMTP_DEBUG); s.ehlo()
+                s.starttls(context=ctx); s.ehlo()
             s.login(MAIL_USER, MAIL_PASS)
             log.info("[SMTP] conectado e autenticado em %s:%s (%s)", host, port, mode)
             return s
         except Exception as e:
             last_err = e
-            try:
-                s.quit()
+            try: s.quit()
             except Exception:
-                try:
-                    s.close()
-                except Exception:
-                    pass
+                try: s.close()
+                except Exception: pass
             log.warning("[SMTP] falhou %s:%s (%s): %s", host, port, mode, e)
 
-    # Bloqueia novas tentativas por um tempo para evitar loop de falhas
     _smtp_block(f"Todas as tentativas SMTP falharam: {last_err}", SMTP_COOLDOWN_SECONDS)
     raise RuntimeError(f"Todas as tentativas SMTP falharam: {last_err}")
 
@@ -456,17 +436,15 @@ def _smtp_connect_with_fallback():
 # Fluxo principal
 # ==========================
 def ensure_reply_prefix(subject: str) -> str:
-    if not subject:
-        return "Re:"
+    if not subject: return "Re:"
     s = subject.strip()
-    if s.lower().startswith("re:"):
-        return s
-    return f"Re: {s}"
+    return s if s.lower().startswith("re:") else f"Re: {s}"
 
 def build_user_prompt(original_subject: str, body_text: str, cobol_files: list) -> str:
-    parts = []
-    parts.append(f"Assunto original: {original_subject}")
-    parts.append("\nCorpo do e-mail do aluno:\n" + (body_text or "(vazio)"))
+    parts = [
+        f"Assunto original: {original_subject}",
+        "\nCorpo do e-mail do aluno:\n" + (body_text or "(vazio)")
+    ]
     if cobol_files:
         parts.append("\nAnexos COBOL (até 80KB cada, apenas resumo):")
         for (fn, snip) in cobol_files:
@@ -487,10 +465,8 @@ def build_outgoing_body(corpo_markdown: str) -> str:
         "",
         f"— {SIGNATURE_NAME.strip()} ",
     ]
-    out = "\n".join(lines)
-    out = out.replace("\r\n", "\n").replace("\r", "\n")
-    out = re.sub(r"\n{3,}", "\n\n", out)
-    return out
+    out = "\n".join(lines).replace("\r\n", "\n").replace("\r", "\n")
+    return re.sub(r"\n{3,}", "\n\n", out)
 
 def send_email_reply(original_msg, to_addr: str, subject: str, body_text: str) -> bytes:
     msg = EmailMessage()
@@ -503,10 +479,8 @@ def send_email_reply(original_msg, to_addr: str, subject: str, body_text: str) -
     msg["X-Mailer"] = "COBOL Support Agent"
 
     if original_msg:
-        try:
-            orig_msgid = original_msg.get("Message-ID")
-        except Exception:
-            orig_msgid = None
+        try: orig_msgid = original_msg.get("Message-ID")
+        except Exception: orig_msgid = None
         if orig_msgid:
             msg["In-Reply-To"] = orig_msgid
             refs = original_msg.get_all("References", [])
@@ -522,21 +496,16 @@ def send_email_reply(original_msg, to_addr: str, subject: str, body_text: str) -
             log.error("SMTP recusou destinatários: %s", refused)
             raise RuntimeError(f"SMTP refused {refused}")
     finally:
-        try:
-            s.quit()
+        try: s.quit()
         except Exception:
-            try:
-                s.close()
-            except Exception:
-                pass
+            try: s.close()
+            except Exception: pass
 
     return msg.as_bytes()
 
 def ensure_mailbox(imap: imaplib.IMAP4_SSL, box: str):
-    try:
-        imap.create(box)
-    except Exception:
-        log.debug("Mailbox pode já existir: %s", box)
+    try: imap.create(box)
+    except Exception: log.debug("Mailbox pode já existir: %s", box)
 
 def move_message_uid(imap: imaplib.IMAP4_SSL, msg_uid: bytes, dest_box: str):
     ensure_mailbox(imap, dest_box)
@@ -551,12 +520,10 @@ def append_to_sent(raw_bytes: bytes):
         imap.logout()
         log.info("Mensagem copiada para a pasta de enviados: %s", SENT_FOLDER)
 
-# Extrai com segurança o corpo bruto do FETCH (evita IndexError)
+# Extrai o corpo de forma segura do retorno do FETCH (sem IndexError)
 def _extract_raw_bytes_from_fetch(msg_data) -> bytes | None:
     if not msg_data:
         return None
-    # `msg_data` costuma ser uma lista com 1 ou mais itens; cada item pode ser:
-    #   (b'UID ... RFC822 {len}', b'rawbytes')  ou apenas flags/trailers.
     for part in msg_data:
         if isinstance(part, tuple) and len(part) >= 2 and isinstance(part[1], (bytes, bytearray)):
             return part[1]
@@ -572,7 +539,7 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_uid: bytes, msg_bytes: bytes
     body_text = extract_text_body(msg)
     cobol_files = extract_cobol_attachments(msg)
 
-    # PRE-TRIAGEM (regex)
+    # PRE-TRIAGEM
     try:
         if AUTO_ESCALATE_FROM_REGEX and re.search(AUTO_ESCALATE_FROM_REGEX, (sender or ""), re.I):
             move_message_uid(imap, msg_uid, _safe_box(FOLDER_ESCALATE))
@@ -585,7 +552,6 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_uid: bytes, msg_bytes: bytes
     except Exception:
         log.debug("Pré-triagem ignorada (regex inválida?)", exc_info=True)
 
-    # CURTO-CIRCUITO: LLM bloqueado
     if _llm_is_blocked_now():
         remaining = max(0, int(_llm_block_until_ts - time.time())) if not LLM_HARD_DISABLE else -1
         log.warning("LLM em cooldown/hard-disable (%ss). Pulando LLM e escalando. De: %s Assunto: %s",
@@ -593,7 +559,6 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_uid: bytes, msg_bytes: bytes
         move_message_uid(imap, msg_uid, _safe_box(FOLDER_ESCALATE))
         return
 
-    log.debug("Email de %s / subj='%s' / anexos=%d", to_reply, original_subject, len(cobol_files))
     user_prompt = build_user_prompt(original_subject or "", body_text, cobol_files)
 
     try:
@@ -605,10 +570,8 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_uid: bytes, msg_bytes: bytes
         return
 
     acao = llm_json.get("acao", "escalar")
-    try:
-        nivel = float(llm_json.get("nivel_confianca", 0) or 0)
-    except Exception:
-        nivel = 0.0
+    try: nivel = float(llm_json.get("nivel_confianca", 0) or 0)
+    except Exception: nivel = 0.0
     assunto_model = llm_json.get("assunto", original_subject or "")
     corpo_markdown = llm_json.get("corpo_markdown", "")
 
@@ -622,7 +585,6 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_uid: bytes, msg_bytes: bytes
     subject_to_send = ensure_reply_prefix(original_subject or assunto_model or "")
     body_out = build_outgoing_body(corpo_markdown)
 
-    # Envio SMTP protegido: se falhar, não reprocessa — move para Escalar.
     try:
         raw_out = send_email_reply(msg, to_reply, subject_to_send, body_out)
         log.info("E-mail enviado para %s (Subject: %s)", to_reply, subject_to_send)
@@ -634,7 +596,8 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_uid: bytes, msg_bytes: bytes
         move_message_uid(imap, msg_uid, _safe_box(FOLDER_PROCESSED))
         log.info("E-mail movido para %s", _safe_box(FOLDER_PROCESSED))
     except Exception:
-        log.error("Falha no envio SMTP — movendo para %s (evita reprocessamento)", _safe_box(FOLDER_ESCALATE), exc_info=True)
+        log.error("Falha no envio SMTP — movendo para %s (evita reprocessamento)",
+                  _safe_box(FOLDER_ESCALATE), exc_info=True)
         move_message_uid(imap, msg_uid, _safe_box(FOLDER_ESCALATE))
 
 # ==========================
@@ -647,8 +610,7 @@ def _imap_uid_search(imap, criteria: str):
 def _select_box(imap, box: str):
     typ, data = imap.select(box)
     if typ == "OK" and data:
-        try:
-            exists = int(data[0])
+        try: exists = int(data[0])
         except Exception:
             exists = data[0].decode() if isinstance(data[0], bytes) else data[0]
         log.debug("SELECT %s → EXISTS=%s", box, exists)
@@ -692,20 +654,15 @@ def watch_imap_loop():
                 if not uids and not IMAP_STRICT_UNSEEN_ONLY:
                     if not uids and not llm_blocked:
                         recent = _imap_uid_search(imap, "NEW")
-                        if recent:
-                            log.debug("NEW (UIDs): %s", recent)
-                            uids = recent
+                        if recent: log.debug("NEW (UIDs): %s", recent); uids = recent
                     if not uids and not llm_blocked:
                         recent = _imap_uid_search(imap, "RECENT")
-                        if recent:
-                            log.debug("RECENT (UIDs): %s", recent)
-                            uids = recent
+                        if recent: log.debug("RECENT (UIDs): %s", recent); uids = recent
                     if (not uids) and IMAP_FALLBACK_LAST_N > 0 and (not llm_blocked or IMAP_FALLBACK_WHEN_LLM_BLOCKED):
                         all_uids = _imap_uid_search(imap, "ALL")
                         tail = all_uids[-IMAP_FALLBACK_LAST_N:] if all_uids else []
                         if tail:
-                            log.warning("UNSEEN/NEW/RECENT vazios — usando últimos %d UIDs: %s",
-                                        IMAP_FALLBACK_LAST_N, tail)
+                            log.warning("UNSEEN/NEW/RECENT vazios — usando últimos %d UIDs: %s", IMAP_FALLBACK_LAST_N, tail)
                             uids = tail
 
                 log.debug("UIDs a processar: %s", uids)
@@ -722,15 +679,21 @@ def watch_imap_loop():
                         if not raw_bytes:
                             log.warning("FETCH sem corpo legível UID=%s — pulando", uid)
                             continue
-                        decide_and_respond(imap, uid, raw_bytes)
+                        try:
+                            decide_and_respond(imap, uid, raw_bytes)
+                        except Exception:
+                            # Blindagem extra: se algo escapou, não reprocessa
+                            log.exception("Exceção em decide_and_respond UID=%s — movendo para Escalar", uid)
+                            try:
+                                move_message_uid(imap, uid, _safe_box(FOLDER_ESCALATE))
+                            except Exception:
+                                log.exception("Falha ao mover UID=%s para Escalar", uid)
                     except Exception:
                         log.exception("Erro ao processar UID=%s", uid)
 
                 if EXPUNGE_AFTER_COPY:
-                    try:
-                        imap.expunge()
-                    except Exception:
-                        log.exception("Falha no expunge final")
+                    try: imap.expunge()
+                    except Exception: log.exception("Falha no expunge final")
 
                 imap.logout()
         except Exception:
@@ -748,10 +711,7 @@ def index():
 
 @app.route("/diag/prompt")
 def diag_prompt():
-    return jsonify({
-        "sha1": SYSTEM_PROMPT_SHA1,
-        "first120": SYSTEM_PROMPT[:120],
-    })
+    return jsonify({"sha1": SYSTEM_PROMPT_SHA1, "first120": SYSTEM_PROMPT[:120]})
 
 @app.route("/diag/llm/unblock", methods=["POST"])
 def diag_llm_unblock():
@@ -760,7 +720,6 @@ def diag_llm_unblock():
     _last_llm_error = ""
     return jsonify({"ok": True, "unblocked": True})
 
-# SMTP: consulta status do cooldown
 @app.route("/diag/smtp/status")
 def diag_smtp_status():
     remaining = max(0, int(_smtp_block_until_ts - time.time()))
@@ -768,14 +727,10 @@ def diag_smtp_status():
         "blocked": _smtp_is_blocked_now(),
         "block_expires_in_seconds": remaining,
         "last_error": _last_smtp_error,
-        "host": SMTP_HOST,
-        "port": SMTP_PORT,
-        "mode": SMTP_TLS_MODE,
-        "fallbacks": SMTP_FALLBACKS,
-        "timeout": SMTP_TIMEOUT,
+        "host": SMTP_HOST, "port": SMTP_PORT, "mode": SMTP_TLS_MODE,
+        "fallbacks": SMTP_FALLBACKS, "timeout": SMTP_TIMEOUT,
     })
 
-# SMTP: tenta um envio de teste
 @app.route("/diag/smtp")
 def diag_smtp():
     to = request.args.get("to", MAIL_USER)
@@ -789,61 +744,32 @@ def diag_smtp():
         log.exception("Falha no /diag/smtp")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.route("/diag/imap")
-def diag_imap():
-    box = request.args.get("box", IMAP_FOLDER_INBOX)
-    n = int(request.args.get("n", "20"))
+# Ping simples ao OpenRouter (curto)
+@app.route("/diag/openrouter-chat")
+def diag_openrouter():
     try:
-        with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
-            imap.login(MAIL_USER, MAIL_PASS)
-            typ, _ = imap.select(box)
-            if typ != "OK":
-                return jsonify({"error": f"não foi possível selecionar {box}"}), 500
-
-            def _count(q):
-                ids = _imap_uid_search(imap, q)
-                tail = [i.decode() if isinstance(i, bytes) else i for i in ids[-n:]]
-                return len(ids), tail
-
-            c_unseen, ids_unseen = _count("UNSEEN")
-            c_new, ids_new = _count("NEW")
-            c_recent, ids_recent = _count("RECENT")
-            c_all, ids_all = _count("ALL")
-
-            imap.logout()
-
-        return jsonify({
-            "box": box,
-            "counts": {"UNSEEN": c_unseen, "NEW": c_new, "RECENT": c_recent, "ALL": c_all},
-            "tail_uids": {"UNSEEN": ids_unseen, "NEW": ids_new, "RECENT": ids_recent, "ALL": ids_all},
-            "strict_unseen_only": IMAP_STRICT_UNSEEN_ONLY,
-            "since_days": IMAP_SINCE_DAYS,
-            "fallback_last_n": IMAP_FALLBACK_LAST_N,
-            "fallback_when_llm_blocked": IMAP_FALLBACK_WHEN_LLM_BLOCKED,
-        })
+        payload = {
+            "model": OPENROUTER_MODEL,
+            "max_tokens": 8,
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": "Responda SOMENTE JSON válido."},
+                {"role": "user", "content": "{\"ok\": true}"}
+            ],
+        }
+        r = _post_openrouter(payload)
+        status = r.status_code
+        try: body = r.json()
+        except Exception: body = {"text": r.text[:200]}
+        return jsonify({"status": status, "body": body})
     except Exception as e:
-        log.exception("diag/imap falhou")
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/diag/llm")
-def diag_llm():
-    remaining = max(0, int(_llm_block_until_ts - time.time()))
-    return jsonify({
-        "blocked": _llm_is_blocked_now(),
-        "block_expires_in_seconds": remaining if not LLM_HARD_DISABLE else None,
-        "hard_disable": LLM_HARD_DISABLE,
-        "last_error": _last_llm_error,
-        "model": OPENROUTER_MODEL,
-        "fallback": OPENROUTER_MODEL_FALLBACK,
-        "cooldown_seconds": LLM_COOLDOWN_SECONDS,
-        "disable_on_402": LLM_DISABLE_ON_402,
-    })
+        return jsonify({"status": 500, "error": str(e)})
 
 if __name__ == "__main__":
     import threading
     t = threading.Thread(target=watch_imap_loop, daemon=True)
     t.start()
-
     port = int(os.getenv("PORT", "10000"))
     log.info("Iniciando Flask em 0.0.0.0:%s", port)
     app.run(host="0.0.0.0", port=port)
