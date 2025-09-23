@@ -1,9 +1,12 @@
-#!/usr/bin/env python3 - v10.8
+#!/usr/bin/env python3 - v10.9
 # -*- coding: utf-8 -*-
 
 """
 COBOL Support Agent — IMAP watcher + SMTP sender + OpenRouter
-– v10.8: SMTP robusto com fallback (587/starttls → 465/ssl → 2525/starttls) e timeout curto.
+– v10.9:
+  * SMTP robusto com fallback + cooldown para evitar “loop” quando o servidor não responde.
+  * Tratamento seguro do FETCH IMAP para evitar IndexError.
+  * Em falha de envio, mover para pasta de Escala/Escalonamento (sem reprocessar).
 """
 
 import os
@@ -51,7 +54,7 @@ IMAP_FALLBACK_LAST_N = int(os.getenv("IMAP_FALLBACK_LAST_N", "0"))  # 0 = deslig
 
 # >>> CONTROLES DE BUSCA IMAP <<<
 IMAP_STRICT_UNSEEN_ONLY = os.getenv("IMAP_STRICT_UNSEEN_ONLY", "true").lower() == "true"
-IMAP_SINCE_DAYS = int(os.getenv("IMAP_SINCE_DAYS", "0"))  # 0 = sem filtro de data
+IMAP_SINCE_DAYS = int(os.getenv("IMAP_SINCE_DAYS", "0"))
 IMAP_FALLBACK_WHEN_LLM_BLOCKED = os.getenv("IMAP_FALLBACK_WHEN_LLM_BLOCKED", "false").lower() == "true"
 
 # SMTP
@@ -60,8 +63,21 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_TLS_MODE = os.getenv("SMTP_TLS_MODE", "starttls").lower()  # starttls|ssl
 SMTP_DEBUG = int(os.getenv("SMTP_DEBUG", "0"))
 SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", "20"))  # segundos
-# Ordem de fallback: porta:modo (a 1ª tentativa é sempre SMTP_PORT/SMTP_TLS_MODE)
 SMTP_FALLBACKS = os.getenv("SMTP_FALLBACKS", "587:starttls,465:ssl,2525:starttls")
+
+# Cooldown de SMTP para evitar loop quando a rede/servidor estão bloqueando
+SMTP_COOLDOWN_SECONDS = int(os.getenv("SMTP_COOLDOWN_SECONDS", "600"))
+_smtp_block_until_ts = 0.0
+_last_smtp_error = ""
+
+def _smtp_is_blocked_now() -> bool:
+    return time.time() < _smtp_block_until_ts
+
+def _smtp_block(reason: str, seconds: int):
+    global _smtp_block_until_ts, _last_smtp_error
+    _last_smtp_error = f"{reason} (cooldown {seconds}s)"
+    _smtp_block_until_ts = time.time() + max(0, seconds)
+    log.warning("SMTP bloqueado: %s", _last_smtp_error)
 
 # LLM / OpenRouter
 LLM_BACKEND = os.getenv("LLM_BACKEND", "openrouter")
@@ -287,11 +303,8 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
             }]
             p["tool_choice"] = "required"
             p["response_format"] = {"type": "json_object"}
-            # p["top_p"] = 0  # descomente se quiser forçar
-
         return p
 
-    # 1) tenta com tools/json_mode
     r = _post_openrouter(_make_payload(compat=False))
     log.debug("OpenRouter status=%s", r.status_code)
 
@@ -327,7 +340,6 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
 
-    # function-calling
     tool_calls = message.get("tool_calls") or []
     if tool_calls:
         try:
@@ -336,7 +348,6 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
         except Exception as e:
             log.debug("Falha ao parsear tool_call.arguments: %s", e)
 
-    # conteúdo normal → extrai 1º objeto JSON
     content = (message.get("content") or "").strip()
     log.debug("LLM raw content (primeiros 400 chars): %s", content[:400])
 
@@ -385,18 +396,15 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
     raise ValueError("Resposta do LLM sem JSON reconhecível.")
 
 # ==========================
-# SMTP com fallback
+# SMTP com fallback + cooldown
 # ==========================
 def _smtp_connect_with_fallback():
-    """
-    Tenta conectar/logar no SMTP:
-    1) Primeiro, (SMTP_HOST, SMTP_PORT, SMTP_TLS_MODE).
-    2) Depois, as combinações em SMTP_FALLBACKS (ex.: 587:starttls,465:ssl,2525:starttls).
-    Retorna um objeto SMTP já autenticado.
-    """
+    if _smtp_is_blocked_now():
+        remaining = int(_smtp_block_until_ts - time.time())
+        raise RuntimeError(f"SMTP em cooldown ({remaining}s) — pulando envio")
+
     attempts = []
     attempts.append((SMTP_TLS_MODE, SMTP_HOST, SMTP_PORT))
-
     for item in (SMTP_FALLBACKS or "").split(","):
         item = item.strip()
         if not item:
@@ -426,7 +434,6 @@ def _smtp_connect_with_fallback():
                 s.ehlo()
                 s.starttls(context=ctx)
                 s.ehlo()
-
             s.login(MAIL_USER, MAIL_PASS)
             log.info("[SMTP] conectado e autenticado em %s:%s (%s)", host, port, mode)
             return s
@@ -441,6 +448,8 @@ def _smtp_connect_with_fallback():
                     pass
             log.warning("[SMTP] falhou %s:%s (%s): %s", host, port, mode, e)
 
+    # Bloqueia novas tentativas por um tempo para evitar loop de falhas
+    _smtp_block(f"Todas as tentativas SMTP falharam: {last_err}", SMTP_COOLDOWN_SECONDS)
     raise RuntimeError(f"Todas as tentativas SMTP falharam: {last_err}")
 
 # ==========================
@@ -542,6 +551,17 @@ def append_to_sent(raw_bytes: bytes):
         imap.logout()
         log.info("Mensagem copiada para a pasta de enviados: %s", SENT_FOLDER)
 
+# Extrai com segurança o corpo bruto do FETCH (evita IndexError)
+def _extract_raw_bytes_from_fetch(msg_data) -> bytes | None:
+    if not msg_data:
+        return None
+    # `msg_data` costuma ser uma lista com 1 ou mais itens; cada item pode ser:
+    #   (b'UID ... RFC822 {len}', b'rawbytes')  ou apenas flags/trailers.
+    for part in msg_data:
+        if isinstance(part, tuple) and len(part) >= 2 and isinstance(part[1], (bytes, bytearray)):
+            return part[1]
+    return None
+
 def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_uid: bytes, msg_bytes: bytes):
     msg = BytesParser(policy=policy.default).parsebytes(msg_bytes)
     sender = decode_mime_words(msg.get("From"))
@@ -602,17 +622,20 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_uid: bytes, msg_bytes: bytes
     subject_to_send = ensure_reply_prefix(original_subject or assunto_model or "")
     body_out = build_outgoing_body(corpo_markdown)
 
-    raw_out = send_email_reply(msg, to_reply, subject_to_send, body_out)
-    log.info("E-mail enviado para %s (Subject: %s)", to_reply, subject_to_send)
-
+    # Envio SMTP protegido: se falhar, não reprocessa — move para Escalar.
     try:
-        ensure_mailbox(imap, SENT_FOLDER)
-        append_to_sent(raw_out)
+        raw_out = send_email_reply(msg, to_reply, subject_to_send, body_out)
+        log.info("E-mail enviado para %s (Subject: %s)", to_reply, subject_to_send)
+        try:
+            ensure_mailbox(imap, SENT_FOLDER)
+            append_to_sent(raw_out)
+        except Exception:
+            log.error("Falha ao copiar para enviados", exc_info=True)
+        move_message_uid(imap, msg_uid, _safe_box(FOLDER_PROCESSED))
+        log.info("E-mail movido para %s", _safe_box(FOLDER_PROCESSED))
     except Exception:
-        log.error("Falha ao copiar para enviados", exc_info=True)
-
-    move_message_uid(imap, msg_uid, _safe_box(FOLDER_PROCESSED))
-    log.info("E-mail movido para %s", _safe_box(FOLDER_PROCESSED))
+        log.error("Falha no envio SMTP — movendo para %s (evita reprocessamento)", _safe_box(FOLDER_ESCALATE), exc_info=True)
+        move_message_uid(imap, msg_uid, _safe_box(FOLDER_ESCALATE))
 
 # ==========================
 # Watcher IMAP (por UID)
@@ -633,7 +656,6 @@ def _select_box(imap, box: str):
         log.warning("Falha ao selecionar caixa %s: %s %s", box, typ, data)
 
 def _imap_since_date(days: int) -> str:
-    """Retorna data IMAP 'DD-Mon-YYYY' em inglês (ex.: 13-Aug-2025)."""
     dt = datetime.now(timezone.utc) - timedelta(days=days)
     mon = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][dt.month - 1]
     return f"{dt.day:02d}-{mon}-{dt.year}"
@@ -664,47 +686,42 @@ def watch_imap_loop():
                 imap.login(MAIL_USER, MAIL_PASS)
                 _select_box(imap, IMAP_FOLDER_INBOX)
 
-                # 1) Sempre tente UNSEEN (com SINCE opcional)
                 uids = _imap_search_unseen(imap, IMAP_SINCE_DAYS)
-
                 llm_blocked = _llm_is_blocked_now()
 
-                # 2) Se modo estrito: NÃO tenta NEW/RECENT/FALLBACK
                 if not uids and not IMAP_STRICT_UNSEEN_ONLY:
                     if not uids and not llm_blocked:
                         recent = _imap_uid_search(imap, "NEW")
                         if recent:
                             log.debug("NEW (UIDs): %s", recent)
                             uids = recent
-
                     if not uids and not llm_blocked:
                         recent = _imap_uid_search(imap, "RECENT")
                         if recent:
                             log.debug("RECENT (UIDs): %s", recent)
                             uids = recent
-
                     if (not uids) and IMAP_FALLBACK_LAST_N > 0 and (not llm_blocked or IMAP_FALLBACK_WHEN_LLM_BLOCKED):
                         all_uids = _imap_uid_search(imap, "ALL")
                         tail = all_uids[-IMAP_FALLBACK_LAST_N:] if all_uids else []
                         if tail:
-                            log.warning(
-                                "UNSEEN/NEW/RECENT vazios — usando últimos %d UIDs: %s",
-                                IMAP_FALLBACK_LAST_N, tail
-                            )
+                            log.warning("UNSEEN/NEW/RECENT vazios — usando últimos %d UIDs: %s",
+                                        IMAP_FALLBACK_LAST_N, tail)
                             uids = tail
 
                 log.debug("UIDs a processar: %s", uids)
 
-                # Processa do menor para o maior
                 for uid in uids:
                     if not uid or not uid.strip():
                         continue
                     try:
                         typ, msg_data = imap.uid("fetch", uid, "(BODY.PEEK[])")
-                        if typ != "OK" or not msg_data or not msg_data[0]:
+                        if typ != "OK" or not msg_data:
                             log.warning("Falha no FETCH UID=%s: %s %s", uid, typ, msg_data)
                             continue
-                        raw_bytes = msg_data[0][1] if isinstance(msg_data[0], tuple) else msg_data[1]
+                        raw_bytes = _extract_raw_bytes_from_fetch(msg_data)
+                        if not raw_bytes:
+                            log.warning("FETCH sem corpo legível UID=%s — pulando", uid)
+                            continue
                         decide_and_respond(imap, uid, raw_bytes)
                     except Exception:
                         log.exception("Erro ao processar UID=%s", uid)
@@ -743,42 +760,22 @@ def diag_llm_unblock():
     _last_llm_error = ""
     return jsonify({"ok": True, "unblocked": True})
 
-def _post_openrouter_diag(payload):
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": OPENROUTER_SITE_URL or APP_PUBLIC_URL or "",
-        "X-Title": OPENROUTER_APP_NAME,
-    }
-    return requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers=headers, data=json.dumps(payload), timeout=20
-    )
+# SMTP: consulta status do cooldown
+@app.route("/diag/smtp/status")
+def diag_smtp_status():
+    remaining = max(0, int(_smtp_block_until_ts - time.time()))
+    return jsonify({
+        "blocked": _smtp_is_blocked_now(),
+        "block_expires_in_seconds": remaining,
+        "last_error": _last_smtp_error,
+        "host": SMTP_HOST,
+        "port": SMTP_PORT,
+        "mode": SMTP_TLS_MODE,
+        "fallbacks": SMTP_FALLBACKS,
+        "timeout": SMTP_TIMEOUT,
+    })
 
-@app.route("/diag/openrouter-chat")
-def diag_openrouter():
-    try:
-        payload = {
-            "model": OPENROUTER_MODEL,
-            "max_tokens": 8,
-            "temperature": 0.1,
-            "top_p": 0,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": "Responda SOMENTE JSON válido."},
-                {"role": "user", "content": "Retorne {\"ok\": true}."},
-            ],
-        }
-        r = _post_openrouter_diag(payload)
-        status = r.status_code
-        try:
-            body = r.json()
-        except Exception:
-            body = {"text": r.text[:200]}
-        return jsonify({"status": status, "body": body})
-    except Exception as e:
-        return jsonify({"status": 500, "error": str(e)})
-
+# SMTP: tenta um envio de teste
 @app.route("/diag/smtp")
 def diag_smtp():
     to = request.args.get("to", MAIL_USER)
@@ -848,6 +845,5 @@ if __name__ == "__main__":
     t.start()
 
     port = int(os.getenv("PORT", "10000"))
-    # Render detecta a porta pelo bind; mantenha 0.0.0.0
     log.info("Iniciando Flask em 0.0.0.0:%s", port)
     app.run(host="0.0.0.0", port=port)
