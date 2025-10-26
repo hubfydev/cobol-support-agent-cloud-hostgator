@@ -1,14 +1,14 @@
-#!/usr/bin/env python3 - v10.13
+#!/usr/bin/env python3 - v10.14
 # -*- coding: utf-8 -*-
 
 """
 COBOL Support Agent — IMAP watcher + SMTP sender + OpenRouter
-– v10.13:
-  * SMTP: suporte a múltiplos hosts via SMTP_HOSTS (csv/; /espaço), com pré-checagem de DNS.
-  * Cooldown SMTP só em falhas temporárias (não aplica para DNS/parse).
-  * Logs aprimorados: mostram hosts parseados e tentativas por host:porta:modo.
-  * Retrocompatível: se SMTP_HOSTS ausente, usa SMTP_HOST.
-  * Sem mudanças de contrato de endpoints /diag; /diag/smtp passa a exibir hosts parseados.
+– v10.14:
+  * SMTP: dial manual com preferência por IPv4 (SMTP_PREFER_IPV4/SMTP_FORCE_IPV4).
+  * Novo /diag/smtp/probe (sem cooldown) e /diag/smtp/unblock.
+  * Logs mostram tentativas com timing; cooldown só para falhas temporárias.
+  * Lê SMTP_CONNECT_TIMEOUT (fallback para SMTP_TIMEOUT).
+  * Retrocompat: SMTP_HOSTS e SMTP_HOST.
 """
 
 import os
@@ -52,21 +52,28 @@ FOLDER_ESCALATE = os.getenv("FOLDER_ESCALATE", "Escalar")
 EXPUNGE_AFTER_COPY = os.getenv("EXPUNGE_AFTER_COPY", "true").lower() == "true"
 SENT_FOLDER = os.getenv("SENT_FOLDER", "INBOX.Sent")
 IMAP_FOLDER_INBOX = os.getenv("IMAP_FOLDER_INBOX", "INBOX")
-IMAP_FALLBACK_LAST_N = int(os.getenv("IMAP_FALLBACK_LAST_N", "0"))  # 0 = desliga
+IMAP_FALLBACK_LAST_N = int(os.getenv("IMAP_FALLBACK_LAST_N", "0"))
 IMAP_STRICT_UNSEEN_ONLY = os.getenv("IMAP_STRICT_UNSEEN_ONLY", "true").lower() == "true"
 IMAP_SINCE_DAYS = int(os.getenv("IMAP_SINCE_DAYS", "0"))
 IMAP_FALLBACK_WHEN_LLM_BLOCKED = os.getenv("IMAP_FALLBACK_WHEN_LLM_BLOCKED", "false").lower() == "true"
 
-# SMTP (v10.13: HOSTS múltiplos + retrocompat)
-SMTP_HOSTS = os.getenv("SMTP_HOSTS", "")  # ex: "mail.dominio.com, br1018.hostgator.com.br"
-SMTP_HOST = os.getenv("SMTP_HOST")  # legado; usado se SMTP_HOSTS vazio
+# SMTP
+SMTP_HOSTS = os.getenv("SMTP_HOSTS", "")
+SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_TLS_MODE = os.getenv("SMTP_TLS_MODE", "starttls").lower()  # starttls|ssl
 SMTP_DEBUG = int(os.getenv("SMTP_DEBUG", "0"))
-SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", "12"))
+
+# timeouts
+SMTP_CONNECT_TIMEOUT = int(os.getenv("SMTP_CONNECT_TIMEOUT", os.getenv("SMTP_TIMEOUT", "12")))
+SMTP_TIMEOUT = SMTP_CONNECT_TIMEOUT  # unificado
+
 SMTP_FALLBACKS = os.getenv("SMTP_FALLBACKS", "465:ssl,2525:starttls")
 
-# SMTP cooldown para evitar loop
+# IPv4 preference (aceita os dois nomes)
+SMTP_PREFER_IPV4 = os.getenv("SMTP_PREFER_IPV4", os.getenv("SMTP_FORCE_IPV4", "false")).lower() == "true"
+
+# SMTP cooldown
 SMTP_COOLDOWN_SECONDS = int(os.getenv("SMTP_COOLDOWN_SECONDS", "900"))
 _smtp_block_until_ts = 0.0
 _last_smtp_error = ""
@@ -91,14 +98,13 @@ OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
 OPENROUTER_TIMEOUT = int(os.getenv("OPENROUTER_TIMEOUT", "30"))
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.8"))
 
-# LLM robustez extra
-LLM_COOLDOWN_SECONDS = int(os.getenv("LLM_COOLDOWN_SECONDS", "900"))  # 15 min
+LLM_COOLDOWN_SECONDS = int(os.getenv("LLM_COOLDOWN_SECONDS", "900"))
 LLM_DISABLE_ON_402 = os.getenv("LLM_DISABLE_ON_402", "true").lower() == "true"
 LLM_HARD_DISABLE = os.getenv("LLM_HARD_DISABLE", "false").lower() == "true"
 _llm_block_until_ts = 0.0
 _last_llm_error = ""
 
-# Pré-triagem (operacional: não gastar LLM)
+# Pré-triagem
 AUTO_ESCALATE_FROM_REGEX = os.getenv(
     "AUTO_ESCALATE_FROM_REGEX",
     r"(?i)(^mailer-daemon@|^postmaster@|^no[-_\. ]?reply@|^noreply@|^2fa@|@hotmart\.com(\.br)?$)"
@@ -149,7 +155,7 @@ SYSTEM_PROMPT = (
     "   (DIVISION, SECTION, PIC, níveis, I/O, SQLCA etc.). Identifique erros comuns e sugira correções objetivas. "
     "9) Não mude o tema da conversa. Responda ao que foi solicitado, de forma educada e objetiva, sempre como parte de um time (nós). "
     "10) Se faltar informação para compilar/executar, peça os dados mínimos (ex.: amostras de entrada/saída, layout, JCL). "
-    "11) No final do 'corpo_markdown', SEMPRE inclua exatamente estas duas linhas (URLs como texto puro, sem markdown de link): "
+    "11) No final do 'corpo_markdown', SEMPRE inclua exatamente estas duas linhas: "
     "- Nossa Comunidade no Telegram: https://t.me/aprendacobol "
     "- Conheça a Formação Completa de Programador COBOL: https://assinatura.aprendacobol.com.br "
 )
@@ -306,10 +312,8 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
         raise RuntimeError(f"OpenRouter HTTP {r.status_code}")
 
     if r.status_code == 400:
-        try:
-            log.error("OpenRouter 400 body (primeiros 500 chars): %s", r.text[:500])
-        except Exception:
-            pass
+        try: log.error("OpenRouter 400 body: %s", r.text[:500])
+        except Exception: pass
         try:
             r = _post_openrouter(_make_payload(compat=True))
         except RequestException as e:
@@ -331,10 +335,8 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
             raise RuntimeError(f"OpenRouter HTTP {r.status_code}")
 
     if r.status_code != 200:
-        try:
-            log.error("OpenRouter erro %s, corpo: %s", r.status_code, r.text[:500])
-        except Exception:
-            pass
+        try: log.error("OpenRouter erro %s, corpo: %s", r.status_code, r.text[:500])
+        except Exception: pass
         raise RuntimeError(f"OpenRouter HTTP {r.status_code}")
 
     try:
@@ -359,10 +361,8 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
 
     m = re.search(r"```(?:json)?\s*({.*})\s*```", content, flags=re.S)
     if m:
-        try:
-            return json.loads(m.group(1))
-        except Exception:
-            pass
+        try: return json.loads(m.group(1))
+        except Exception: pass
 
     content = content.replace("```json", "```").strip("`").strip()
 
@@ -397,37 +397,29 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
     raise ValueError("Resposta do LLM sem JSON reconhecível.")
 
 # ==========================
-# SMTP helpers (v10.13)
+# SMTP helpers (v10.14)
 # ==========================
 def _parse_smtp_hosts(env_value: str) -> list[str]:
-    """Converte 'a,b ; c   d' -> ['a','b','c','d'] (remove duplicados, preserva ordem)."""
-    items = []
     if not env_value:
-        return items
+        return []
+    items = []
     raw = env_value.replace(';', ',').replace('\n', ' ')
     for token in raw.split(','):
         token = token.strip()
-        if not token:
-            continue
-        # também dividir por espaço
+        if not token: continue
         for t in token.split():
             t = t.strip()
-            if t:
-                items.append(t)
-    seen = set()
-    uniq = []
+            if t: items.append(t)
+    seen, uniq = set(), []
     for h in items:
         if h not in seen:
-            uniq.append(h)
-            seen.add(h)
+            uniq.append(h); seen.add(h)
     return uniq
 
 def _effective_smtp_hosts() -> list[str]:
     hosts = _parse_smtp_hosts(SMTP_HOSTS)
-    if not hosts:
-        # retrocompat: cai para SMTP_HOST se definido
-        if SMTP_HOST:
-            hosts = [SMTP_HOST]
+    if not hosts and SMTP_HOST:
+        hosts = [SMTP_HOST]
     return hosts
 
 def _can_resolve_host(host: str) -> bool:
@@ -438,25 +430,81 @@ def _can_resolve_host(host: str) -> bool:
         return False
 
 def _is_temporary_smtp_error(exc: Exception) -> bool:
-    """Classifica se erro sugere indisponibilidade temporária (aplica cooldown)."""
-    # falhas de rede/timeout em geral tratamos como temporárias
     if isinstance(exc, (smtplib.SMTPServerDisconnected,
                         smtplib.SMTPConnectError,
                         smtplib.SMTPDataError,
                         smtplib.SMTPHeloError,
                         smtplib.SMTPAuthenticationError,
-                        TimeoutError)):
+                        TimeoutError,
+                        socket.timeout,
+                        ConnectionRefusedError)):
         return True
-    if isinstance(exc, socket.timeout):
-        return True
-    # DNS (gaierror) não é temporário para nosso cooldown
     if isinstance(exc, socket.gaierror):
         return False
-    # por padrão, considere temporário (mais seguro contra loops)
     return True
 
+def _resolve_endpoints(host: str, port: int, prefer_ipv4: bool):
+    families = [socket.AF_INET] if prefer_ipv4 else [socket.AF_UNSPEC]
+    endpoints = []
+    for fam in families:
+        try:
+            infos = socket.getaddrinfo(host, port, fam, socket.SOCK_STREAM)
+            endpoints.extend(infos)
+        except socket.gaierror:
+            continue
+    if prefer_ipv4:
+        endpoints.sort(key=lambda x: 0 if x[0] == socket.AF_INET else 1)
+    return endpoints
+
+def _dial_smtp_endpoint(host: str, port: int, mode: str, timeout: int, ctx: ssl.SSLContext):
+    endpoints = _resolve_endpoints(host, port, SMTP_PREFER_IPV4)
+    if not endpoints:
+        raise RuntimeError(f"getaddrinfo vazio para {host}:{port}")
+
+    last_exc = None
+    for family, socktype, proto, _, sockaddr in endpoints:
+        sock = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            sock.settimeout(timeout)
+            t0 = time.time()
+            sock.connect(sockaddr)
+            t_ms = int((time.time() - t0) * 1000)
+
+            if mode == "ssl":
+                ssl_sock = ctx.wrap_socket(sock, server_hostname=host)
+                s = smtplib.SMTP_SSL()
+                s.timeout = timeout
+                s.sock = ssl_sock
+                s.file = s.sock.makefile("rb")
+                s._host = host
+                s.ehlo()
+                log.info("[SMTP] TCP+SSL OK %s:%s em %dms", host, port, t_ms)
+                return s
+            else:
+                s = smtplib.SMTP()
+                s.timeout = timeout
+                s.sock = sock
+                s.file = s.sock.makefile("rb")
+                s._host = host
+                s.ehlo()
+                s.starttls(context=ctx)
+                s.ehlo()
+                log.info("[SMTP] TCP+STARTTLS OK %s:%s em %dms", host, port, t_ms)
+                return s
+
+        except Exception as e:
+            last_exc = e
+            try:
+                if sock: sock.close()
+            except Exception:
+                pass
+            continue
+
+    raise last_exc if last_exc else RuntimeError("Falha desconhecida no dial SMTP")
+
 # ==========================
-# SMTP com fallback + cooldown (atualizado v10.13)
+# SMTP com fallback + cooldown (atualizado)
 # ==========================
 def _smtp_connect_with_fallback():
     if _smtp_is_blocked_now():
@@ -465,18 +513,13 @@ def _smtp_connect_with_fallback():
 
     hosts = _effective_smtp_hosts()
     if not hosts:
-        raise RuntimeError("Nenhum host SMTP definido. Configure SMTP_HOSTS (recomendado) ou SMTP_HOST.")
+        raise RuntimeError("Nenhum host SMTP definido. Configure SMTP_HOSTS ou SMTP_HOST.")
 
-    # lista de tentativas: (host, porta, modo)
     attempts = []
-    # tentativa principal (porta/modo atuais)
     attempts.extend([(h, SMTP_PORT, SMTP_TLS_MODE) for h in hosts])
-
-    # fallbacks de porta/modo
     for item in (SMTP_FALLBACKS or "").split(","):
         item = item.strip()
-        if not item:
-            continue
+        if not item: continue
         try:
             port_str, mode = item.split(":", 1)
             port = int(port_str)
@@ -492,39 +535,24 @@ def _smtp_connect_with_fallback():
     had_temporary_error = False
 
     for host, port, mode in attempts:
-        # evitar tentativas inúteis se o host não resolve DNS
         if not _can_resolve_host(host):
-            log.warning("[SMTP] host sem DNS: %s — pulando este host (sem cooldown)", host)
+            log.warning("[SMTP] host sem DNS: %s — pulando (sem cooldown)", host)
             last_err = RuntimeError(f"DNS não resolve para {host}")
             continue
-
         try:
-            log.info("[SMTP] tentando %s:%s (%s)", host, port, mode)
-            if mode == "ssl":
-                s = smtplib.SMTP_SSL(host=host, port=port, timeout=SMTP_TIMEOUT, context=ctx)
-                s.set_debuglevel(SMTP_DEBUG)
-                s.ehlo()
-            else:
-                s = smtplib.SMTP(host=host, port=port, timeout=SMTP_TIMEOUT)
-                s.set_debuglevel(SMTP_DEBUG)
-                s.ehlo()
-                s.starttls(context=ctx)
-                s.ehlo()
-
+            log.info("[SMTP] tentando %s:%s (%s) ipv4_prefer=%s", host, port, mode, SMTP_PREFER_IPV4)
+            s = _dial_smtp_endpoint(host, port, mode, SMTP_TIMEOUT, ctx)
+            s.set_debuglevel(SMTP_DEBUG)
             s.login(MAIL_USER, MAIL_PASS)
             log.info("[SMTP] conectado e autenticado em %s:%s (%s)", host, port, mode)
             return s
-
         except Exception as e:
             last_err = e
-            # tentar fechar socket
             try:
                 s.quit()
             except Exception:
                 try: s.close()
                 except Exception: pass
-
-            # classificar para cooldown
             if _is_temporary_smtp_error(e):
                 had_temporary_error = True
                 log.warning("[SMTP] falhou %s:%s (%s) — temporário: %s", host, port, mode, e)
@@ -532,12 +560,10 @@ def _smtp_connect_with_fallback():
                 log.warning("[SMTP] falhou %s:%s (%s) — configuração/DNS (sem cooldown): %s", host, port, mode, e)
             continue
 
-    # se chegamos aqui, tudo falhou
     if had_temporary_error:
         _smtp_block(f"Todas as tentativas SMTP falharam (erros temporários). Último erro: {last_err}", SMTP_COOLDOWN_SECONDS)
         raise RuntimeError(f"Todas as tentativas SMTP falharam (temporário). Cooldown {SMTP_COOLDOWN_SECONDS}s. Último erro: {last_err}")
     else:
-        # erros permanentes (DNS/parse) — não aplicar cooldown
         raise RuntimeError(f"Falha de configuração/DNS em SMTP: {last_err} (sem cooldown)")
 
 # ==========================
@@ -628,7 +654,6 @@ def append_to_sent(raw_bytes: bytes):
         imap.logout()
         log.info("Mensagem copiada para a pasta de enviados: %s", SENT_FOLDER)
 
-# Extrai o corpo de forma segura do retorno do FETCH (sem IndexError)
 def _extract_raw_bytes_from_fetch(msg_data) -> bytes | None:
     if not msg_data:
         return None
@@ -791,7 +816,6 @@ def watch_imap_loop():
                         try:
                             decide_and_respond(imap, uid, raw_bytes)
                         except Exception:
-                            # Blindagem extra: se algo escapou, não reprocessa
                             log.exception("Exceção em decide_and_respond UID=%s — movendo para Escalar", uid)
                             try:
                                 move_message_uid(imap, uid, _safe_box(FOLDER_ESCALATE))
@@ -854,46 +878,56 @@ def diag_smtp_status():
         "primary": {"host": SMTP_HOST or None, "port": SMTP_PORT, "mode": SMTP_TLS_MODE},
         "fallbacks": SMTP_FALLBACKS,
         "timeout": SMTP_TIMEOUT,
+        "prefer_ipv4": SMTP_PREFER_IPV4,
     })
 
-@app.route("/diag/smtp")
-def diag_smtp():
-    to = request.args.get("to", MAIL_USER)
-    subject = "Teste SMTP — COBOL Support Agent"
-    body = "Olá! Este é um teste de envio SMTP direto do /diag/smtp.\n\n— Sistema"
-    try:
-        raw = send_email_reply(None, to, subject, body)
-        append_to_sent(raw)
-        return jsonify({"ok": True, "to": to})
-    except Exception as e:
-        log.exception("Falha no /diag/smtp")
-        return jsonify({"ok": False, "error": str(e)}), 500
+@app.route("/diag/smtp/unblock", methods=["POST"])
+def diag_smtp_unblock():
+    global _smtp_block_until_ts, _last_smtp_error
+    _smtp_block_until_ts = 0.0
+    _last_smtp_error = ""
+    return jsonify({"ok": True, "unblocked": True})
 
-# Ping simples ao OpenRouter (curto)
-@app.route("/diag/openrouter-chat")
-def diag_openrouter():
-    try:
-        payload = {
-            "model": OPENROUTER_MODEL,
-            "max_tokens": 8,
-            "temperature": 0.0,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": "Responda SOMENTE JSON válido."},
-                {"role": "user", "content": "{\"ok\": true}"}
-            ],
-        }
-        r = _post_openrouter(payload)
-        status = r.status_code
-        try: body = r.json()
-        except Exception: body = {"text": r.text[:200]}
-        return jsonify({"status": status, "body": body})
-    except Exception as e:
-        return jsonify({"status": 500, "error": str(e)})
+@app.route("/diag/smtp/probe")
+def diag_smtp_probe():
+    """Prova todas as tentativas (sem enviar e-mail) e SEM cooldown."""
+    hosts = _effective_smtp_hosts()
+    attempts = []
+    attempts.extend([(h, SMTP_PORT, SMTP_TLS_MODE) for h in hosts])
+    for item in (SMTP_FALLBACKS or "").split(","):
+        item = item.strip()
+        if not item: continue
+        try:
+            port_str, mode = item.split(":", 1)
+            port = int(port_str)
+            mode = mode.strip().lower()
+            for h in hosts:
+                if (h, port, mode) not in attempts:
+                    attempts.append((h, port, mode))
+        except Exception:
+            continue
+
+    ctx = ssl.create_default_context()
+    report = []
+    for host, port, mode in attempts:
+        entry = {"host": host, "port": port, "mode": mode, "ok": False}
+        try:
+            s = _dial_smtp_endpoint(host, port, mode, SMTP_TIMEOUT, ctx)
+            try: s.close()
+            except Exception: pass
+            entry["ok"] = True
+        except Exception as e:
+            entry["error"] = str(e)
+        report.append(entry)
+
+    return jsonify({
+        "prefer_ipv4": SMTP_PREFER_IPV4,
+        "hosts": hosts,
+        "attempts": report,
+    })
 
 @app.route("/diag/imap")
 def diag_imap():
-    """Mostra contagens UNSEEN/NEW/RECENT/ALL e últimos UIDs. Parâmetros: /diag/imap?box=INBOX&n=20"""
     box = request.args.get("box", IMAP_FOLDER_INBOX)
     n = int(request.args.get("n", "20"))
     try:
