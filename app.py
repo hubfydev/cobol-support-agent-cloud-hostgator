@@ -1,14 +1,13 @@
-#!/usr/bin/env python3 - v10.14
+#!/usr/bin/env python3 - v10.15
 # -*- coding: utf-8 -*-
 
 """
 COBOL Support Agent — IMAP watcher + SMTP sender + OpenRouter
-– v10.14:
-  * SMTP: dial manual com preferência por IPv4 (SMTP_PREFER_IPV4/SMTP_FORCE_IPV4).
-  * Novo /diag/smtp/probe (sem cooldown) e /diag/smtp/unblock.
-  * Logs mostram tentativas com timing; cooldown só para falhas temporárias.
-  * Lê SMTP_CONNECT_TIMEOUT (fallback para SMTP_TIMEOUT).
-  * Retrocompat: SMTP_HOSTS e SMTP_HOST.
+– v10.15:
+  * Envio primário por API da Mailgun (se MAILGUN_API_KEY/MAILGUN_DOMAIN presentes).
+  * Fallback automático para SMTP (v10.14) com IPv4 preferível, probe e unblock.
+  * Novo /diag/email (envio real via transporte primário + fallback) e /diag/transport/status.
+  * Mantém /diag/smtp/probe, /diag/smtp/unblock, cooldown SMTP só para falhas temporárias.
 """
 
 import os
@@ -45,7 +44,7 @@ log = logging.getLogger(__name__)
 # IMAP
 IMAP_HOST = os.getenv("IMAP_HOST")
 IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
-MAIL_USER = os.getenv("MAIL_USER")
+MAIL_USER = os.getenv("MAIL_USER")  # Ex.: suporte@aprendacobol.com.br
 MAIL_PASS = os.getenv("MAIL_PASS")
 FOLDER_PROCESSED = os.getenv("FOLDER_PROCESSED", "Respondidos")
 FOLDER_ESCALATE = os.getenv("FOLDER_ESCALATE", "Escalar")
@@ -57,23 +56,16 @@ IMAP_STRICT_UNSEEN_ONLY = os.getenv("IMAP_STRICT_UNSEEN_ONLY", "true").lower() =
 IMAP_SINCE_DAYS = int(os.getenv("IMAP_SINCE_DAYS", "0"))
 IMAP_FALLBACK_WHEN_LLM_BLOCKED = os.getenv("IMAP_FALLBACK_WHEN_LLM_BLOCKED", "false").lower() == "true"
 
-# SMTP
+# SMTP (fallback)
 SMTP_HOSTS = os.getenv("SMTP_HOSTS", "")
 SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_TLS_MODE = os.getenv("SMTP_TLS_MODE", "starttls").lower()  # starttls|ssl
 SMTP_DEBUG = int(os.getenv("SMTP_DEBUG", "0"))
-
-# timeouts
 SMTP_CONNECT_TIMEOUT = int(os.getenv("SMTP_CONNECT_TIMEOUT", os.getenv("SMTP_TIMEOUT", "12")))
-SMTP_TIMEOUT = SMTP_CONNECT_TIMEOUT  # unificado
-
+SMTP_TIMEOUT = SMTP_CONNECT_TIMEOUT
 SMTP_FALLBACKS = os.getenv("SMTP_FALLBACKS", "465:ssl,2525:starttls")
-
-# IPv4 preference (aceita os dois nomes)
 SMTP_PREFER_IPV4 = os.getenv("SMTP_PREFER_IPV4", os.getenv("SMTP_FORCE_IPV4", "false")).lower() == "true"
-
-# SMTP cooldown
 SMTP_COOLDOWN_SECONDS = int(os.getenv("SMTP_COOLDOWN_SECONDS", "900"))
 _smtp_block_until_ts = 0.0
 _last_smtp_error = ""
@@ -86,6 +78,18 @@ def _smtp_block(reason: str, seconds: int):
     _last_smtp_error = f"{reason} (cooldown {seconds}s)"
     _smtp_block_until_ts = time.time() + max(0, seconds)
     log.warning("SMTP bloqueado: %s", _last_smtp_error)
+
+# Mailgun API (primário)
+MAILGUN_API_KEY = os.getenv("MAILGUN_API_KEY", "").strip()
+MAILGUN_DOMAIN = os.getenv("MAILGUN_DOMAIN", "").strip()       # ex.: mg.aprendacobol.com.br
+MAILGUN_API_BASE = os.getenv("MAILGUN_API_BASE", "https://api.mailgun.net/v3").rstrip("/")
+MAIL_PRIMARY = os.getenv("MAIL_PRIMARY", "").strip().lower()    # "mailgun_api" | "smtp" | "" (auto)
+
+def _mail_primary_transport() -> str:
+    # Se explicitado, respeita; senão, AUTO: usa Mailgun API se credenciais presentes
+    if MAIL_PRIMARY in ("mailgun_api", "smtp"):
+        return MAIL_PRIMARY
+    return "mailgun_api" if (MAILGUN_API_KEY and MAILGUN_DOMAIN) else "smtp"
 
 # LLM / OpenRouter
 LLM_BACKEND = os.getenv("LLM_BACKEND", "openrouter")
@@ -397,7 +401,7 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
     raise ValueError("Resposta do LLM sem JSON reconhecível.")
 
 # ==========================
-# SMTP helpers (v10.14)
+# SMTP helpers (fallback)
 # ==========================
 def _parse_smtp_hosts(env_value: str) -> list[str]:
     if not env_value:
@@ -503,9 +507,6 @@ def _dial_smtp_endpoint(host: str, port: int, mode: str, timeout: int, ctx: ssl.
 
     raise last_exc if last_exc else RuntimeError("Falha desconhecida no dial SMTP")
 
-# ==========================
-# SMTP com fallback + cooldown (atualizado)
-# ==========================
 def _smtp_connect_with_fallback():
     if _smtp_is_blocked_now():
         remaining = int(_smtp_block_until_ts - time.time())
@@ -567,7 +568,7 @@ def _smtp_connect_with_fallback():
         raise RuntimeError(f"Falha de configuração/DNS em SMTP: {last_err} (sem cooldown)")
 
 # ==========================
-# Fluxo principal
+# Construção do e-mail (com headers de thread)
 # ==========================
 def ensure_reply_prefix(subject: str) -> str:
     if not subject: return "Re:"
@@ -602,41 +603,102 @@ def build_outgoing_body(corpo_markdown: str) -> str:
     out = "\n".join(lines).replace("\r\n", "\n").replace("\r", "\n")
     return re.sub(r"\n{3,}", "\n\n", out)
 
+def _thread_headers_for(original_msg):
+    headers = {}
+    if original_msg:
+        try:
+            orig_msgid = original_msg.get("Message-ID")
+        except Exception:
+            orig_msgid = None
+        if orig_msgid:
+            headers["In-Reply-To"] = orig_msgid
+            refs = original_msg.get_all("References", [])
+            ref_line = " ".join(refs + [orig_msgid]) if refs else orig_msgid
+            headers["References"] = ref_line
+    return headers
+
+# ==========================
+# Envio por Mailgun API (primário)
+# ==========================
+def _send_via_mailgun_api(to_addr: str, subject: str, body_text: str, extra_headers: dict) -> dict:
+    if not (MAILGUN_API_KEY and MAILGUN_DOMAIN):
+        raise RuntimeError("Mailgun API não configurada (defina MAILGUN_API_KEY e MAILGUN_DOMAIN).")
+
+    url = f"{MAILGUN_API_BASE}/{MAILGUN_DOMAIN}/messages"
+    auth = ("api", MAILGUN_API_KEY)
+    data = {
+        "from": MAIL_USER or f"postmaster@{MAILGUN_DOMAIN}",
+        "to": [to_addr],
+        "subject": subject,
+        "text": body_text,
+    }
+    # Headers de thread (Mailgun aceita prefixo h:)
+    for k, v in (extra_headers or {}).items():
+        if v:
+            data[f"h:{k}"] = v
+
+    r = requests.post(url, auth=auth, data=data, timeout=20)
+    if r.status_code // 100 != 2:
+        raise RuntimeError(f"Mailgun API HTTP {r.status_code}: {r.text[:300]}")
+    try:
+        return r.json()
+    except Exception:
+        return {"ok": True, "raw": r.text[:300]}
+
+# ==========================
+# Envio (API primária + SMTP fallback)
+# ==========================
 def send_email_reply(original_msg, to_addr: str, subject: str, body_text: str) -> bytes:
+    """
+    Tenta 1) Mailgun API (se configurada), senão 2) SMTP com fallback.
+    Retorna o MIME em bytes (para copiar para Sent).
+    """
+    # Monta MIME (independente do transporte)
     msg = EmailMessage()
-    msg["From"] = MAIL_USER
-    msg["Sender"] = MAIL_USER
+    msg["From"] = MAIL_USER or f"postmaster@{MAILGUN_DOMAIN}" if MAILGUN_DOMAIN else MAIL_USER
+    msg["Sender"] = msg["From"]
     msg["To"] = to_addr
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain=(MAIL_USER.split("@", 1)[-1] if MAIL_USER and "@" in MAIL_USER else None))
     msg["X-Mailer"] = "COBOL Support Agent"
 
-    if original_msg:
-        try: orig_msgid = original_msg.get("Message-ID")
-        except Exception: orig_msgid = None
-        if orig_msgid:
-            msg["In-Reply-To"] = orig_msgid
-            refs = original_msg.get_all("References", [])
-            ref_line = " ".join(refs + [orig_msgid]) if refs else orig_msgid
-            msg["References"] = ref_line
+    th = _thread_headers_for(original_msg)
+    for k, v in th.items():
+        msg[k] = v
 
     msg.set_content(body_text)
 
+    transport = _mail_primary_transport()
+    last_err = None
+
+    # 1) Primário: Mailgun API
+    if transport == "mailgun_api":
+        try:
+            _ = _send_via_mailgun_api(to_addr, subject, body_text, th)
+            log.info("E-mail enviado via Mailgun API para %s (Subject: %s)", to_addr, subject)
+            return msg.as_bytes()
+        except Exception as e:
+            last_err = e
+            log.warning("Falha no envio via Mailgun API — tentando SMTP fallback: %s", e)
+
+    # 2) Fallback: SMTP
     s = _smtp_connect_with_fallback()
     try:
-        refused = s.sendmail(MAIL_USER, [to_addr], msg.as_string())
+        refused = s.sendmail(msg["From"], [to_addr], msg.as_string())
         if refused:
-            log.error("SMTP recusou destinatários: %s", refused)
             raise RuntimeError(f"SMTP refused {refused}")
+        log.info("E-mail enviado via SMTP para %s (Subject: %s)", to_addr, subject)
+        return msg.as_bytes()
     finally:
         try: s.quit()
         except Exception:
             try: s.close()
             except Exception: pass
 
-    return msg.as_bytes()
-
+# ==========================
+# IMAP helpers
+# ==========================
 def ensure_mailbox(imap: imaplib.IMAP4_SSL, box: str):
     try: imap.create(box)
     except Exception: log.debug("Mailbox pode já existir: %s", box)
@@ -662,6 +724,9 @@ def _extract_raw_bytes_from_fetch(msg_data) -> bytes | None:
             return part[1]
     return None
 
+# ==========================
+# Fluxo principal
+# ==========================
 def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_uid: bytes, msg_bytes: bytes):
     msg = BytesParser(policy=policy.default).parsebytes(msg_bytes)
     sender = decode_mime_words(msg.get("From"))
@@ -685,6 +750,7 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_uid: bytes, msg_bytes: bytes
     except Exception:
         log.debug("Pré-triagem ignorada (regex inválida?)", exc_info=True)
 
+    # Se LLM bloqueado, escalamos sem chamar LLM
     if _llm_is_blocked_now():
         remaining = max(0, int(_llm_block_until_ts - time.time())) if not LLM_HARD_DISABLE else -1
         log.warning("LLM em cooldown/hard-disable (%ss). Pulando LLM e escalando. De: %s Assunto: %s",
@@ -729,7 +795,7 @@ def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_uid: bytes, msg_bytes: bytes
         move_message_uid(imap, msg_uid, _safe_box(FOLDER_PROCESSED))
         log.info("E-mail movido para %s", _safe_box(FOLDER_PROCESSED))
     except Exception:
-        log.error("Falha no envio SMTP — movendo para %s (evita reprocessamento)",
+        log.error("Falha no envio — movendo para %s (evita reprocessamento)",
                   _safe_box(FOLDER_ESCALATE), exc_info=True)
         move_message_uid(imap, msg_uid, _safe_box(FOLDER_ESCALATE))
 
@@ -763,7 +829,7 @@ def _imap_search_unseen(imap, since_days: int) -> list[bytes]:
 
 def watch_imap_loop():
     hosts = _effective_smtp_hosts()
-    log.info("Watcher IMAP — envio via SMTP hosts=%s", hosts or "[nenhum host configurado]")
+    log.info("Watcher IMAP — envio primário=%s | SMTP hosts=%s", _mail_primary_transport(), hosts or "[nenhum host configurado]")
     log.info("App público em: %s", APP_PUBLIC_URL)
     log.info(
         "IMAP_STRICT_UNSEEN_ONLY=%s | IMAP_SINCE_DAYS=%d | IMAP_FALLBACK_LAST_N=%d | IMAP_FALLBACK_WHEN_LLM_BLOCKED=%s",
@@ -867,6 +933,28 @@ def diag_llm_unblock():
     _last_llm_error = ""
     return jsonify({"ok": True, "unblocked": True})
 
+@app.route("/diag/transport/status")
+def diag_transport_status():
+    remaining = max(0, int(_smtp_block_until_ts - time.time()))
+    return jsonify({
+        "primary_transport": _mail_primary_transport(),
+        "mailgun": {
+            "configured": bool(MAILGUN_API_KEY and MAILGUN_DOMAIN),
+            "domain": MAILGUN_DOMAIN or None,
+            "api_base": MAILGUN_API_BASE,
+        },
+        "smtp": {
+            "blocked": _smtp_is_blocked_now(),
+            "block_expires_in_seconds": remaining,
+            "last_error": _last_smtp_error,
+            "hosts": _effective_smtp_hosts(),
+            "primary": {"host": SMTP_HOST or None, "port": SMTP_PORT, "mode": SMTP_TLS_MODE},
+            "fallbacks": SMTP_FALLBACKS,
+            "timeout": SMTP_TIMEOUT,
+            "prefer_ipv4": SMTP_PREFER_IPV4,
+        }
+    })
+
 @app.route("/diag/smtp/status")
 def diag_smtp_status():
     remaining = max(0, int(_smtp_block_until_ts - time.time()))
@@ -926,6 +1014,27 @@ def diag_smtp_probe():
         "attempts": report,
     })
 
+@app.route("/diag/email")
+def diag_email():
+    """
+    Envio real usando transporte primário (Mailgun API se configurada; se falhar, SMTP).
+    Parâmetros: /diag/email?to=alguem@destino.com&subject=Teste&body=Texto
+    """
+    to = request.args.get("to", MAIL_USER)
+    subject = request.args.get("subject", "Teste de envio — COBOL Support Agent")
+    body = request.args.get("body", "Olá! Teste de envio com transporte primário + fallback.\n\n— Sistema")
+    try:
+        raw = send_email_reply(None, to, subject, body)
+        # opcional: copia para Sent (IMAP)
+        try:
+            append_to_sent(raw)
+        except Exception:
+            log.exception("Falha ao copiar para enviados (opcional)")
+        return jsonify({"ok": True, "to": to, "primary_transport": _mail_primary_transport()})
+    except Exception as e:
+        log.exception("Falha no /diag/email")
+        return jsonify({"ok": False, "error": str(e), "primary_transport": _mail_primary_transport()}), 500
+
 @app.route("/diag/imap")
 def diag_imap():
     box = request.args.get("box", IMAP_FOLDER_INBOX)
@@ -958,6 +1067,9 @@ def diag_imap():
         log.exception("diag/imap falhou")
         return jsonify({"error": str(e)}), 500
 
+# ==========================
+# Main
+# ==========================
 if __name__ == "__main__":
     import threading
     t = threading.Thread(target=watch_imap_loop, daemon=True)
