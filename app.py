@@ -1,14 +1,14 @@
-#!/usr/bin/env python3 - v10.10
+#!/usr/bin/env python3 - v10.12
 # -*- coding: utf-8 -*-
 
 """
 COBOL Support Agent — IMAP watcher + SMTP sender + OpenRouter
-– v10.10:
-  * SMTP: fallback + cooldown; em falha, mover para Escalar.
-  * LLM: captura robusta de erros de rede (requests/ChunkedEncoding/Resets) e escala.
-  * IMAP: FETCH seguro (sem IndexError) e proteção adicional no loop. 
+– v10.12:
+  * Reintroduz AUTO_ESCALATE_* (pré-triagem por remetente/assunto).
+  * Adiciona /diag/imap e /diag/llm (status).
+  * Captura RequestException (inclui ConnectionError/ChunkedEncodingError).
+  * Polimentos gerais.
 """
-
 
 import os
 import re
@@ -19,7 +19,6 @@ import hashlib
 import logging
 import imaplib
 import smtplib
-import socket
 
 from datetime import datetime, timedelta, timezone
 
@@ -95,6 +94,16 @@ LLM_DISABLE_ON_402 = os.getenv("LLM_DISABLE_ON_402", "true").lower() == "true"
 LLM_HARD_DISABLE = os.getenv("LLM_HARD_DISABLE", "false").lower() == "true"
 _llm_block_until_ts = 0.0
 _last_llm_error = ""
+
+# Pré-triagem (operacional: não gastar LLM)
+AUTO_ESCALATE_FROM_REGEX = os.getenv(
+    "AUTO_ESCALATE_FROM_REGEX",
+    r"(?i)(^mailer-daemon@|^postmaster@|^no[-_\. ]?reply@|^noreply@|^2fa@|@hotmart\.com(\.br)?$)"
+)
+AUTO_ESCALATE_SUBJECT_REGEX = os.getenv(
+    "AUTO_ESCALATE_SUBJECT_REGEX",
+    r"(?i)(verification code|delivery status|failure notice|bounce|sale made|refund|payment|invoice|assinatura|pagamento atrasado|chargeback)"
+)
 
 # App
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
@@ -228,7 +237,7 @@ def extract_cobol_attachments(msg, max_bytes=80_000):
 # OpenRouter client
 # ==========================
 import requests
-from requests.exceptions import RequestException, ChunkedEncodingError
+from requests.exceptions import RequestException
 
 def _post_openrouter(payload):
     headers = {
@@ -237,7 +246,6 @@ def _post_openrouter(payload):
         "HTTP-Referer": OPENROUTER_SITE_URL or APP_PUBLIC_URL or "",
         "X-Title": OPENROUTER_APP_NAME,
     }
-    # timeout curto o suficiente para não travar
     return requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers=headers,
@@ -284,7 +292,7 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
 
     try:
         r = _post_openrouter(_make_payload(compat=False))
-    except (RequestException, ChunkedEncodingError, ConnectionError) as e:
+    except RequestException as e:
         _llm_block(f"OpenRouter network error: {e}", LLM_COOLDOWN_SECONDS)
         raise RuntimeError("OpenRouter network error")
 
@@ -301,7 +309,7 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
             pass
         try:
             r = _post_openrouter(_make_payload(compat=True))
-        except (RequestException, ChunkedEncodingError, ConnectionError) as e:
+        except RequestException as e:
             _llm_block(f"OpenRouter network error (compat): {e}", LLM_COOLDOWN_SECONDS)
             raise RuntimeError("OpenRouter network error (compat)")
         log.debug("OpenRouter (compat) status=%s", r.status_code)
@@ -311,7 +319,7 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
         payload["model"] = OPENROUTER_MODEL_FALLBACK
         try:
             r = _post_openrouter(payload)
-        except (RequestException, ChunkedEncodingError, ConnectionError) as e:
+        except RequestException as e:
             _llm_block(f"OpenRouter network error (fallback): {e}", LLM_COOLDOWN_SECONDS)
             raise RuntimeError("OpenRouter network error (fallback)")
         log.debug("OpenRouter fallback status=%s", r.status_code)
@@ -714,6 +722,20 @@ def index():
 def diag_prompt():
     return jsonify({"sha1": SYSTEM_PROMPT_SHA1, "first120": SYSTEM_PROMPT[:120]})
 
+@app.route("/diag/llm")
+def diag_llm_status():
+    remaining = max(0, int(_llm_block_until_ts - time.time()))
+    return jsonify({
+        "blocked": _llm_is_blocked_now(),
+        "block_expires_in_seconds": remaining if not LLM_HARD_DISABLE else None,
+        "hard_disable": LLM_HARD_DISABLE,
+        "last_error": _last_llm_error,
+        "model": OPENROUTER_MODEL,
+        "fallback": OPENROUTER_MODEL_FALLBACK,
+        "cooldown_seconds": LLM_COOLDOWN_SECONDS,
+        "disable_on_402": LLM_DISABLE_ON_402,
+    })
+
 @app.route("/diag/llm/unblock", methods=["POST"])
 def diag_llm_unblock():
     global _llm_block_until_ts, _last_llm_error
@@ -766,6 +788,39 @@ def diag_openrouter():
         return jsonify({"status": status, "body": body})
     except Exception as e:
         return jsonify({"status": 500, "error": str(e)})
+
+@app.route("/diag/imap")
+def diag_imap():
+    """Mostra contagens UNSEEN/NEW/RECENT/ALL e últimos UIDs. Parâmetros: /diag/imap?box=INBOX&n=20"""
+    box = request.args.get("box", IMAP_FOLDER_INBOX)
+    n = int(request.args.get("n", "20"))
+    try:
+        with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
+            imap.login(MAIL_USER, MAIL_PASS)
+            typ, _ = imap.select(box)
+            if typ != "OK":
+                return jsonify({"error": f"não foi possível selecionar {box}"}), 500
+
+            def _count(q):
+                ids = _imap_uid_search(imap, q)
+                tail = [i.decode() if isinstance(i, bytes) else i for i in ids[-n:]]
+                return len(ids), tail
+
+            c_unseen, ids_unseen = _count("UNSEEN")
+            c_new, ids_new = _count("NEW")
+            c_recent, ids_recent = _count("RECENT")
+            c_all, ids_all = _count("ALL")
+
+            imap.logout()
+
+        return jsonify({
+            "box": box,
+            "counts": {"UNSEEN": c_unseen, "NEW": c_new, "RECENT": c_recent, "ALL": c_all},
+            "tail_uids": {"UNSEEN": ids_unseen, "NEW": ids_new, "RECENT": ids_recent, "ALL": ids_all},
+        })
+    except Exception as e:
+        log.exception("diag/imap falhou")
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     import threading
