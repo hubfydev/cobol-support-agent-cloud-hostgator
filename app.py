@@ -1,13 +1,14 @@
-#!/usr/bin/env python3 - v10.12
+#!/usr/bin/env python3 - v10.13
 # -*- coding: utf-8 -*-
 
 """
 COBOL Support Agent — IMAP watcher + SMTP sender + OpenRouter
-– v10.12:
-  * Reintroduz AUTO_ESCALATE_* (pré-triagem por remetente/assunto).
-  * Adiciona /diag/imap e /diag/llm (status).
-  * Captura RequestException (inclui ConnectionError/ChunkedEncodingError).
-  * Polimentos gerais.
+– v10.13:
+  * SMTP: suporte a múltiplos hosts via SMTP_HOSTS (csv/; /espaço), com pré-checagem de DNS.
+  * Cooldown SMTP só em falhas temporárias (não aplica para DNS/parse).
+  * Logs aprimorados: mostram hosts parseados e tentativas por host:porta:modo.
+  * Retrocompatível: se SMTP_HOSTS ausente, usa SMTP_HOST.
+  * Sem mudanças de contrato de endpoints /diag; /diag/smtp passa a exibir hosts parseados.
 """
 
 import os
@@ -19,6 +20,7 @@ import hashlib
 import logging
 import imaplib
 import smtplib
+import socket
 
 from datetime import datetime, timedelta, timezone
 
@@ -55,8 +57,9 @@ IMAP_STRICT_UNSEEN_ONLY = os.getenv("IMAP_STRICT_UNSEEN_ONLY", "true").lower() =
 IMAP_SINCE_DAYS = int(os.getenv("IMAP_SINCE_DAYS", "0"))
 IMAP_FALLBACK_WHEN_LLM_BLOCKED = os.getenv("IMAP_FALLBACK_WHEN_LLM_BLOCKED", "false").lower() == "true"
 
-# SMTP
-SMTP_HOST = os.getenv("SMTP_HOST")
+# SMTP (v10.13: HOSTS múltiplos + retrocompat)
+SMTP_HOSTS = os.getenv("SMTP_HOSTS", "")  # ex: "mail.dominio.com, br1018.hostgator.com.br"
+SMTP_HOST = os.getenv("SMTP_HOST")  # legado; usado se SMTP_HOSTS vazio
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_TLS_MODE = os.getenv("SMTP_TLS_MODE", "starttls").lower()  # starttls|ssl
 SMTP_DEBUG = int(os.getenv("SMTP_DEBUG", "0"))
@@ -394,52 +397,148 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
     raise ValueError("Resposta do LLM sem JSON reconhecível.")
 
 # ==========================
-# SMTP com fallback + cooldown
+# SMTP helpers (v10.13)
+# ==========================
+def _parse_smtp_hosts(env_value: str) -> list[str]:
+    """Converte 'a,b ; c   d' -> ['a','b','c','d'] (remove duplicados, preserva ordem)."""
+    items = []
+    if not env_value:
+        return items
+    raw = env_value.replace(';', ',').replace('\n', ' ')
+    for token in raw.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        # também dividir por espaço
+        for t in token.split():
+            t = t.strip()
+            if t:
+                items.append(t)
+    seen = set()
+    uniq = []
+    for h in items:
+        if h not in seen:
+            uniq.append(h)
+            seen.add(h)
+    return uniq
+
+def _effective_smtp_hosts() -> list[str]:
+    hosts = _parse_smtp_hosts(SMTP_HOSTS)
+    if not hosts:
+        # retrocompat: cai para SMTP_HOST se definido
+        if SMTP_HOST:
+            hosts = [SMTP_HOST]
+    return hosts
+
+def _can_resolve_host(host: str) -> bool:
+    try:
+        socket.getaddrinfo(host, None)
+        return True
+    except socket.gaierror:
+        return False
+
+def _is_temporary_smtp_error(exc: Exception) -> bool:
+    """Classifica se erro sugere indisponibilidade temporária (aplica cooldown)."""
+    # falhas de rede/timeout em geral tratamos como temporárias
+    if isinstance(exc, (smtplib.SMTPServerDisconnected,
+                        smtplib.SMTPConnectError,
+                        smtplib.SMTPDataError,
+                        smtplib.SMTPHeloError,
+                        smtplib.SMTPAuthenticationError,
+                        TimeoutError)):
+        return True
+    if isinstance(exc, socket.timeout):
+        return True
+    # DNS (gaierror) não é temporário para nosso cooldown
+    if isinstance(exc, socket.gaierror):
+        return False
+    # por padrão, considere temporário (mais seguro contra loops)
+    return True
+
+# ==========================
+# SMTP com fallback + cooldown (atualizado v10.13)
 # ==========================
 def _smtp_connect_with_fallback():
     if _smtp_is_blocked_now():
         remaining = int(_smtp_block_until_ts - time.time())
         raise RuntimeError(f"SMTP em cooldown ({remaining}s) — pulando envio")
 
-    attempts = [(SMTP_TLS_MODE, SMTP_HOST, SMTP_PORT)]
+    hosts = _effective_smtp_hosts()
+    if not hosts:
+        raise RuntimeError("Nenhum host SMTP definido. Configure SMTP_HOSTS (recomendado) ou SMTP_HOST.")
+
+    # lista de tentativas: (host, porta, modo)
+    attempts = []
+    # tentativa principal (porta/modo atuais)
+    attempts.extend([(h, SMTP_PORT, SMTP_TLS_MODE) for h in hosts])
+
+    # fallbacks de porta/modo
     for item in (SMTP_FALLBACKS or "").split(","):
         item = item.strip()
-        if not item: continue
+        if not item:
+            continue
         try:
             port_str, mode = item.split(":", 1)
             port = int(port_str)
             mode = mode.strip().lower()
-            if (mode, SMTP_HOST, port) not in attempts:
-                attempts.append((mode, SMTP_HOST, port))
+            for h in hosts:
+                if (h, port, mode) not in attempts:
+                    attempts.append((h, port, mode))
         except Exception:
             continue
 
-    last_err = None
     ctx = ssl.create_default_context()
+    last_err = None
+    had_temporary_error = False
 
-    for mode, host, port in attempts:
+    for host, port, mode in attempts:
+        # evitar tentativas inúteis se o host não resolve DNS
+        if not _can_resolve_host(host):
+            log.warning("[SMTP] host sem DNS: %s — pulando este host (sem cooldown)", host)
+            last_err = RuntimeError(f"DNS não resolve para {host}")
+            continue
+
         try:
             log.info("[SMTP] tentando %s:%s (%s)", host, port, mode)
             if mode == "ssl":
-                s = smtplib.SMTP_SSL(host, port, timeout=SMTP_TIMEOUT, context=ctx)
-                s.set_debuglevel(SMTP_DEBUG); s.ehlo()
+                s = smtplib.SMTP_SSL(host=host, port=port, timeout=SMTP_TIMEOUT, context=ctx)
+                s.set_debuglevel(SMTP_DEBUG)
+                s.ehlo()
             else:
-                s = smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT)
-                s.set_debuglevel(SMTP_DEBUG); s.ehlo()
-                s.starttls(context=ctx); s.ehlo()
+                s = smtplib.SMTP(host=host, port=port, timeout=SMTP_TIMEOUT)
+                s.set_debuglevel(SMTP_DEBUG)
+                s.ehlo()
+                s.starttls(context=ctx)
+                s.ehlo()
+
             s.login(MAIL_USER, MAIL_PASS)
             log.info("[SMTP] conectado e autenticado em %s:%s (%s)", host, port, mode)
             return s
+
         except Exception as e:
             last_err = e
-            try: s.quit()
+            # tentar fechar socket
+            try:
+                s.quit()
             except Exception:
                 try: s.close()
                 except Exception: pass
-            log.warning("[SMTP] falhou %s:%s (%s): %s", host, port, mode, e)
 
-    _smtp_block(f"Todas as tentativas SMTP falharam: {last_err}", SMTP_COOLDOWN_SECONDS)
-    raise RuntimeError(f"Todas as tentativas SMTP falharam: {last_err}")
+            # classificar para cooldown
+            if _is_temporary_smtp_error(e):
+                had_temporary_error = True
+                log.warning("[SMTP] falhou %s:%s (%s) — temporário: %s", host, port, mode, e)
+            else:
+                log.warning("[SMTP] falhou %s:%s (%s) — configuração/DNS (sem cooldown): %s", host, port, mode, e)
+            continue
+
+    # se chegamos aqui, tudo falhou
+    if had_temporary_error:
+        _smtp_block(f"Todas as tentativas SMTP falharam (erros temporários). Último erro: {last_err}", SMTP_COOLDOWN_SECONDS)
+        raise RuntimeError(f"Todas as tentativas SMTP falharam (temporário). Cooldown {SMTP_COOLDOWN_SECONDS}s. Último erro: {last_err}")
+    else:
+        # erros permanentes (DNS/parse) — não aplicar cooldown
+        raise RuntimeError(f"Falha de configuração/DNS em SMTP: {last_err} (sem cooldown)")
 
 # ==========================
 # Fluxo principal
@@ -638,7 +737,8 @@ def _imap_search_unseen(imap, since_days: int) -> list[bytes]:
     return _imap_uid_search(imap, "UNSEEN")
 
 def watch_imap_loop():
-    log.info("Watcher IMAP — envio via SMTP %s", SMTP_HOST)
+    hosts = _effective_smtp_hosts()
+    log.info("Watcher IMAP — envio via SMTP hosts=%s", hosts or "[nenhum host configurado]")
     log.info("App público em: %s", APP_PUBLIC_URL)
     log.info(
         "IMAP_STRICT_UNSEEN_ONLY=%s | IMAP_SINCE_DAYS=%d | IMAP_FALLBACK_LAST_N=%d | IMAP_FALLBACK_WHEN_LLM_BLOCKED=%s",
@@ -750,8 +850,10 @@ def diag_smtp_status():
         "blocked": _smtp_is_blocked_now(),
         "block_expires_in_seconds": remaining,
         "last_error": _last_smtp_error,
-        "host": SMTP_HOST, "port": SMTP_PORT, "mode": SMTP_TLS_MODE,
-        "fallbacks": SMTP_FALLBACKS, "timeout": SMTP_TIMEOUT,
+        "hosts": _effective_smtp_hosts(),
+        "primary": {"host": SMTP_HOST or None, "port": SMTP_PORT, "mode": SMTP_TLS_MODE},
+        "fallbacks": SMTP_FALLBACKS,
+        "timeout": SMTP_TIMEOUT,
     })
 
 @app.route("/diag/smtp")
