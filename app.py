@@ -1,8 +1,12 @@
-#!/usr/bin/env python3 - v10.15
+#!/usr/bin/env python3 - v10.15.1
 # -*- coding: utf-8 -*-
 
 """
 COBOL Support Agent — IMAP watcher + SMTP sender + OpenRouter
+– v10.15.1:
+  * (NOVO) IMAP_USER/IMAP_PASS para separar credenciais de leitura (IMAP) do MAIL_USER/MAIL_PASS.
+  * (NOVO) /diag/imap/auth: testa autenticação IMAP (login/logout) e retorna o erro literal.
+  * Ajustes internos para usar helper centralizado de credenciais IMAP.
 – v10.15:
   * Envio primário por API da Mailgun (se MAILGUN_API_KEY/MAILGUN_DOMAIN presentes).
   * Fallback automático para SMTP (v10.14) com IPv4 preferível, probe e unblock.
@@ -44,8 +48,21 @@ log = logging.getLogger(__name__)
 # IMAP
 IMAP_HOST = os.getenv("IMAP_HOST")
 IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
+
+# Credenciais “genéricas” (também usadas como From).
 MAIL_USER = os.getenv("MAIL_USER")  # Ex.: suporte@aprendacobol.com.br
 MAIL_PASS = os.getenv("MAIL_PASS")
+
+# (NOVO) Overrides específicos para IMAP (se não definidos, usa MAIL_USER/MAIL_PASS)
+IMAP_USER = os.getenv("IMAP_USER", "").strip() or None
+IMAP_PASS = os.getenv("IMAP_PASS", "").strip() or None
+
+def _imap_creds():
+    """Retorna (user, pass) para login IMAP, respeitando overrides IMAP_USER/IMAP_PASS."""
+    user = IMAP_USER if IMAP_USER else MAIL_USER
+    pw   = IMAP_PASS if IMAP_PASS else MAIL_PASS
+    return user, pw
+
 FOLDER_PROCESSED = os.getenv("FOLDER_PROCESSED", "Respondidos")
 FOLDER_ESCALATE = os.getenv("FOLDER_ESCALATE", "Escalar")
 EXPUNGE_AFTER_COPY = os.getenv("EXPUNGE_AFTER_COPY", "true").lower() == "true"
@@ -655,7 +672,7 @@ def send_email_reply(original_msg, to_addr: str, subject: str, body_text: str) -
     """
     # Monta MIME (independente do transporte)
     msg = EmailMessage()
-    msg["From"] = MAIL_USER or f"postmaster@{MAILGUN_DOMAIN}" if MAILGUN_DOMAIN else MAIL_USER
+    msg["From"] = MAIL_USER or (f"postmaster@{MAILGUN_DOMAIN}" if MAILGUN_DOMAIN else MAIL_USER)
     msg["Sender"] = msg["From"]
     msg["To"] = to_addr
     msg["Subject"] = subject
@@ -709,8 +726,9 @@ def move_message_uid(imap: imaplib.IMAP4_SSL, msg_uid: bytes, dest_box: str):
     imap.uid("STORE", msg_uid, "+FLAGS", r"(\Deleted)")
 
 def append_to_sent(raw_bytes: bytes):
+    u, p = _imap_creds()
     with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
-        imap.login(MAIL_USER, MAIL_PASS)
+        imap.login(u, p)
         ensure_mailbox(imap, SENT_FOLDER)
         imap.append(SENT_FOLDER, r"(\Seen)", None, raw_bytes)
         imap.logout()
@@ -845,7 +863,8 @@ def watch_imap_loop():
                     except Exception:
                         pass
 
-                imap.login(MAIL_USER, MAIL_PASS)
+                u, p = _imap_creds()
+                imap.login(u, p)
                 _select_box(imap, IMAP_FOLDER_INBOX)
 
                 uids = _imap_search_unseen(imap, IMAP_SINCE_DAYS)
@@ -1040,8 +1059,9 @@ def diag_imap():
     box = request.args.get("box", IMAP_FOLDER_INBOX)
     n = int(request.args.get("n", "20"))
     try:
+        u, p = _imap_creds()
         with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
-            imap.login(MAIL_USER, MAIL_PASS)
+            imap.login(u, p)
             typ, _ = imap.select(box)
             if typ != "OK":
                 return jsonify({"error": f"não foi possível selecionar {box}"}), 500
@@ -1066,6 +1086,28 @@ def diag_imap():
     except Exception as e:
         log.exception("diag/imap falhou")
         return jsonify({"error": str(e)}), 500
+
+# (NOVO) Teste explícito de autenticação IMAP
+@app.route("/diag/imap/auth")
+def diag_imap_auth():
+    """
+    Testa somente o login IMAP e retorna erro literal do servidor.
+    Parâmetros opcionais: host, port
+    Ex.: /diag/imap/auth?host=mail.aprendacobol.com.br&port=993
+    """
+    host = request.args.get("host", IMAP_HOST)
+    port = int(request.args.get("port", IMAP_PORT))
+    u, p = _imap_creds()
+    try:
+        with imaplib.IMAP4_SSL(host, port) as imap:
+            try:
+                imap.login(u, p)
+                imap.logout()
+                return jsonify({"ok": True, "host": host, "port": port, "user": u})
+            except imaplib.IMAP4.error as e:
+                return jsonify({"ok": False, "host": host, "port": port, "user": u, "error": str(e)}), 401
+    except Exception as e:
+        return jsonify({"ok": False, "host": host, "port": port, "user": u, "error": str(e)}), 500
 
 # ==========================
 # Main
