@@ -4,7 +4,10 @@
 """
 COBOL Support Agent — IMAP watcher + SMTP sender + OpenRouter
 – v10.15.2:
-  * (NOVO) /diag/net/egress para obter IPv4/IPv6 públicos (whitelist na HostGator).
+  * (NOVO) /diag/net/egress: descobre IPv4/IPv6 públicos via múltiplos provedores.
+  * (AJUSTE) Trim em MAIL_USER/MAIL_PASS/IMAP_USER/IMAP_PASS para evitar espaços ocultos.
+  * (AJUSTE) Loga usuário do IMAP mascarado antes do login (observabilidade).
+  * (AJUSTE) Correção de precedência ao definir header From quando MAIL_USER não existir.
 – v10.15.1:
   * (NOVO) IMAP_USER/IMAP_PASS para separar credenciais de leitura (IMAP) do MAIL_USER/MAIL_PASS.
   * (NOVO) /diag/imap/auth: testa autenticação IMAP (login/logout) e retorna o erro literal.
@@ -52,12 +55,12 @@ IMAP_HOST = os.getenv("IMAP_HOST")
 IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
 
 # Credenciais “genéricas” (também usadas como From).
-MAIL_USER = os.getenv("MAIL_USER")  # Ex.: suporte@aprendacobol.com.br
-MAIL_PASS = os.getenv("MAIL_PASS")
+MAIL_USER = (os.getenv("MAIL_USER") or "").strip()  # Ex.: suporte@aprendacobol.com.br
+MAIL_PASS = (os.getenv("MAIL_PASS") or "").strip()
 
 # (NOVO) Overrides específicos para IMAP (se não definidos, usa MAIL_USER/MAIL_PASS)
-IMAP_USER = os.getenv("IMAP_USER", "").strip() or None
-IMAP_PASS = os.getenv("IMAP_PASS", "").strip() or None
+IMAP_USER = (os.getenv("IMAP_USER", "") or "").strip() or None
+IMAP_PASS = (os.getenv("IMAP_PASS", "") or "").strip() or None
 
 def _imap_creds():
     """Retorna (user, pass) para login IMAP, respeitando overrides IMAP_USER/IMAP_PASS."""
@@ -99,10 +102,10 @@ def _smtp_block(reason: str, seconds: int):
     log.warning("SMTP bloqueado: %s", _last_smtp_error)
 
 # Mailgun API (primário)
-MAILGUN_API_KEY = os.getenv("MAILGUN_API_KEY", "").strip()
-MAILGUN_DOMAIN = os.getenv("MAILGUN_DOMAIN", "").strip()       # ex.: mg.aprendacobol.com.br
-MAILGUN_API_BASE = os.getenv("MAILGUN_API_BASE", "https://api.mailgun.net/v3").rstrip("/")
-MAIL_PRIMARY = os.getenv("MAIL_PRIMARY", "").strip().lower()    # "mailgun_api" | "smtp" | "" (auto)
+MAILGUN_API_KEY = (os.getenv("MAILGUN_API_KEY", "") or "").strip()
+MAILGUN_DOMAIN = (os.getenv("MAILGUN_DOMAIN", "") or "").strip()       # ex.: mg.aprendacobol.com.br
+MAILGUN_API_BASE = (os.getenv("MAILGUN_API_BASE", "https://api.mailgun.net/v3") or "").rstrip("/")
+MAIL_PRIMARY = (os.getenv("MAIL_PRIMARY", "") or "").strip().lower()    # "mailgun_api" | "smtp" | "" (auto)
 
 def _mail_primary_transport() -> str:
     # Se explicitado, respeita; senão, AUTO: usa Mailgun API se credenciais presentes
@@ -646,7 +649,7 @@ def _send_via_mailgun_api(to_addr: str, subject: str, body_text: str, extra_head
     url = f"{MAILGUN_API_BASE}/{MAILGUN_DOMAIN}/messages"
     auth = ("api", MAILGUN_API_KEY)
     data = {
-        "from": MAIL_USER or f"postmaster@{MAILGUN_DOMAIN}",
+        "from": (MAIL_USER if MAIL_USER else f"postmaster@{MAILGUN_DOMAIN}"),
         "to": [to_addr],
         "subject": subject,
         "text": body_text,
@@ -674,12 +677,15 @@ def send_email_reply(original_msg, to_addr: str, subject: str, body_text: str) -
     """
     # Monta MIME (independente do transporte)
     msg = EmailMessage()
-    msg["From"] = MAIL_USER or (f"postmaster@{MAILGUN_DOMAIN}" if MAILGUN_DOMAIN else MAIL_USER)
-    msg["Sender"] = msg["From"]
+    msg_from = MAIL_USER if MAIL_USER else (f"postmaster@{MAILGUN_DOMAIN}" if MAILGUN_DOMAIN else None)
+    if not msg_from:
+        raise RuntimeError("Sem remetente válido: defina MAIL_USER ou MAILGUN_DOMAIN.")
+    msg["From"] = msg_from
+    msg["Sender"] = msg_from
     msg["To"] = to_addr
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid(domain=(MAIL_USER.split("@", 1)[-1] if MAIL_USER and "@" in MAIL_USER else None))
+    msg["Message-ID"] = make_msgid(domain=(MAIL_USER.split("@", 1)[-1] if MAIL_USER and "@" in MAIL_USER else (MAILGUN_DOMAIN or None)))
     msg["X-Mailer"] = "COBOL Support Agent"
 
     th = _thread_headers_for(original_msg)
@@ -747,6 +753,13 @@ def _extract_raw_bytes_from_fetch(msg_data) -> bytes | None:
 # ==========================
 # Fluxo principal
 # ==========================
+def _mask_user(s: str) -> str:
+    if not s: return ""
+    if "@" in s:
+        name, dom = s.split("@", 1)
+        return (name[:2] + "***@" + dom)
+    return s[:2] + "***"
+
 def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_uid: bytes, msg_bytes: bytes):
     msg = BytesParser(policy=policy.default).parsebytes(msg_bytes)
     sender = decode_mime_words(msg.get("From"))
@@ -866,6 +879,7 @@ def watch_imap_loop():
                         pass
 
                 u, p = _imap_creds()
+                log.info("IMAP tentando login como %s em %s:%s", _mask_user(u), IMAP_HOST, IMAP_PORT)
                 imap.login(u, p)
                 _select_box(imap, IMAP_FOLDER_INBOX)
 
@@ -1103,6 +1117,7 @@ def diag_imap_auth():
     try:
         with imaplib.IMAP4_SSL(host, port) as imap:
             try:
+                log.info("IMAP AUTH teste como %s em %s:%s", _mask_user(u), host, port)
                 imap.login(u, p)
                 imap.logout()
                 return jsonify({"ok": True, "host": host, "port": port, "user": u})
@@ -1111,20 +1126,49 @@ def diag_imap_auth():
     except Exception as e:
         return jsonify({"ok": False, "host": host, "port": port, "user": u, "error": str(e)}), 500
 
-# (NOVO) IP público de egress (para whitelist em provedores)
+# (NOVO) IP público de saída (egress)
 @app.route("/diag/net/egress")
 def diag_net_egress():
+    """
+    Descobre IPv4/IPv6 públicos do serviço consultando múltiplos provedores.
+    Útil para pedir whitelist no provedor de e-mail (IMAP/SMTP).
+    """
+    providers = [
+        ("https://api.ipify.org", {}),
+        ("https://ifconfig.me/ip", {}),
+        ("https://ipinfo.io/ip", {}),
+        ("https://ident.me", {}),
+    ]
+    results = {"ipv4": None, "ipv6": None, "sources": []}
+    seen = set()
+    for url, params in providers:
+        try:
+            r = requests.get(url, timeout=4)
+            txt = (r.text or "").strip()
+            if txt and txt not in seen:
+                seen.add(txt)
+                results["sources"].append({"url": url, "value": txt, "status": r.status_code})
+                # classifica por formato
+                if ":" in txt:
+                    if results["ipv6"] is None:
+                        results["ipv6"] = txt
+                else:
+                    if results["ipv4"] is None:
+                        results["ipv4"] = txt
+            else:
+                results["sources"].append({"url": url, "value": txt, "status": r.status_code})
+        except Exception as e:
+            results["sources"].append({"url": url, "error": str(e)})
+    # Também mostra IP local da interface de saída (NÃO é o público)
     try:
-        r4 = requests.get("https://api.ipify.org", timeout=5)
-        ip4 = r4.text.strip()
-    except Exception as e:
-        ip4 = f"erro IPv4: {e}"
-    try:
-        r6 = requests.get("https://api6.ipify.org", timeout=5)
-        ip6 = r6.text.strip()
-    except Exception as e:
-        ip6 = f"erro IPv6: {e}"
-    return jsonify({"ipv4": ip4, "ipv6": ip6})
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1.0)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        local_ip = None
+    return jsonify({"ipv4": results["ipv4"], "ipv6": results["ipv6"], "local_ipv4": local_ip, "providers": results["sources"]})
 
 # ==========================
 # Main
