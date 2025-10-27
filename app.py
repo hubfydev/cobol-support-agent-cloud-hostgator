@@ -1,8 +1,10 @@
-#!/usr/bin/env python3 - v10.15.1
+#!/usr/bin/env python3 - v10.15.2
 # -*- coding: utf-8 -*-
 
 """
 COBOL Support Agent — IMAP watcher + SMTP sender + OpenRouter
+– v10.15.2:
+  * (NOVO) /diag/net/egress para obter IPv4/IPv6 públicos (whitelist na HostGator).
 – v10.15.1:
   * (NOVO) IMAP_USER/IMAP_PASS para separar credenciais de leitura (IMAP) do MAIL_USER/MAIL_PASS.
   * (NOVO) /diag/imap/auth: testa autenticação IMAP (login/logout) e retorna o erro literal.
@@ -1108,6 +1110,21 @@ def diag_imap_auth():
                 return jsonify({"ok": False, "host": host, "port": port, "user": u, "error": str(e)}), 401
     except Exception as e:
         return jsonify({"ok": False, "host": host, "port": port, "user": u, "error": str(e)}), 500
+
+# (NOVO) IP público de egress (para whitelist em provedores)
+@app.route("/diag/net/egress")
+def diag_net_egress():
+    try:
+        r4 = requests.get("https://api.ipify.org", timeout=5)
+        ip4 = r4.text.strip()
+    except Exception as e:
+        ip4 = f"erro IPv4: {e}"
+    try:
+        r6 = requests.get("https://api6.ipify.org", timeout=5)
+        ip6 = r6.text.strip()
+    except Exception as e:
+        ip6 = f"erro IPv6: {e}"
+    return jsonify({"ipv4": ip4, "ipv6": ip6})
 
 # ==========================
 # Main
