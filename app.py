@@ -52,7 +52,7 @@ log = logging.getLogger(__name__)
 
 # IMAP
 IMAP_HOST = os.getenv("IMAP_HOST")
-IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
+IMAP_PORT = int(os.getenv("IMAP_PORT", "143"))
 
 # Credenciais “genéricas” (também usadas como From).
 MAIL_USER = (os.getenv("MAIL_USER") or "").strip()  # Ex.: suporte@aprendacobol.com.br
@@ -1109,7 +1109,7 @@ def diag_imap_auth():
     """
     Testa somente o login IMAP e retorna erro literal do servidor.
     Parâmetros opcionais: host, port
-    Ex.: /diag/imap/auth?host=mail.aprendacobol.com.br&port=993
+    Ex.: /diag/imap/auth?host=mail.aprendacobol.com.br&port=143
     """
     host = request.args.get("host", IMAP_HOST)
     port = int(request.args.get("port", IMAP_PORT))
