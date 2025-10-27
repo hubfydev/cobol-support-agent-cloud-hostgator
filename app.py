@@ -1,17 +1,25 @@
-#!/usr/bin/env python3 - v10.15.2
+#!/usr/bin/env python3 - v10.15.3
 # -*- coding: utf-8 -*-
 
 """
 COBOL Support Agent — IMAP watcher + SMTP sender + OpenRouter
+
+– v10.15.3:
+  * (NOVO) Suporte a IMAP_TLS_MODE (ssl|starttls) para funcionar na 993 (SSL) e 143 (STARTTLS).
+  * (AJUSTE) Todos os pontos de conexão IMAP passam a usar _imap_connect().
+  * (AJUSTE) Logs mostram modo/porta do IMAP.
+
 – v10.15.2:
   * (NOVO) /diag/net/egress: descobre IPv4/IPv6 públicos via múltiplos provedores.
   * (AJUSTE) Trim em MAIL_USER/MAIL_PASS/IMAP_USER/IMAP_PASS para evitar espaços ocultos.
   * (AJUSTE) Loga usuário do IMAP mascarado antes do login (observabilidade).
   * (AJUSTE) Correção de precedência ao definir header From quando MAIL_USER não existir.
+
 – v10.15.1:
   * (NOVO) IMAP_USER/IMAP_PASS para separar credenciais de leitura (IMAP) do MAIL_USER/MAIL_PASS.
   * (NOVO) /diag/imap/auth: testa autenticação IMAP (login/logout) e retorna o erro literal.
   * Ajustes internos para usar helper centralizado de credenciais IMAP.
+
 – v10.15:
   * Envio primário por API da Mailgun (se MAILGUN_API_KEY/MAILGUN_DOMAIN presentes).
   * Fallback automático para SMTP (v10.14) com IPv4 preferível, probe e unblock.
@@ -52,13 +60,14 @@ log = logging.getLogger(__name__)
 
 # IMAP
 IMAP_HOST = os.getenv("IMAP_HOST")
-IMAP_PORT = int(os.getenv("IMAP_PORT", "143"))
+IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
+IMAP_TLS_MODE = os.getenv("IMAP_TLS_MODE", "ssl").lower()  # "ssl" | "starttls"
 
 # Credenciais “genéricas” (também usadas como From).
 MAIL_USER = (os.getenv("MAIL_USER") or "").strip()  # Ex.: suporte@aprendacobol.com.br
 MAIL_PASS = (os.getenv("MAIL_PASS") or "").strip()
 
-# (NOVO) Overrides específicos para IMAP (se não definidos, usa MAIL_USER/MAIL_PASS)
+# Overrides específicos para IMAP (se não definidos, usa MAIL_USER/MAIL_PASS)
 IMAP_USER = (os.getenv("IMAP_USER", "") or "").strip() or None
 IMAP_PASS = (os.getenv("IMAP_PASS", "") or "").strip() or None
 
@@ -722,21 +731,39 @@ def send_email_reply(original_msg, to_addr: str, subject: str, body_text: str) -
             except Exception: pass
 
 # ==========================
-# IMAP helpers
+# IMAP helpers (inclui STARTTLS/SSL)
 # ==========================
-def ensure_mailbox(imap: imaplib.IMAP4_SSL, box: str):
+def _imap_connect(host: str, port: int, user: str, password: str) -> imaplib.IMAP4:
+    """
+    Abre conexão IMAP respeitando IMAP_TLS_MODE:
+      - ssl: usa IMAP4_SSL(host, port)
+      - starttls: usa IMAP4(host, port) + starttls()
+    """
+    ctx = ssl.create_default_context()
+    if IMAP_TLS_MODE == "ssl":
+        imap = imaplib.IMAP4_SSL(host, port)
+        imap.login(user, password)
+        return imap
+    elif IMAP_TLS_MODE == "starttls":
+        imap = imaplib.IMAP4(host, port)
+        imap.starttls(ssl_context=ctx)
+        imap.login(user, password)
+        return imap
+    else:
+        raise RuntimeError(f"IMAP_TLS_MODE inválido: {IMAP_TLS_MODE} (use 'ssl' ou 'starttls')")
+
+def ensure_mailbox(imap: imaplib.IMAP4, box: str):
     try: imap.create(box)
     except Exception: log.debug("Mailbox pode já existir: %s", box)
 
-def move_message_uid(imap: imaplib.IMAP4_SSL, msg_uid: bytes, dest_box: str):
+def move_message_uid(imap: imaplib.IMAP4, msg_uid: bytes, dest_box: str):
     ensure_mailbox(imap, dest_box)
     imap.uid("COPY", msg_uid, dest_box)
     imap.uid("STORE", msg_uid, "+FLAGS", r"(\Deleted)")
 
 def append_to_sent(raw_bytes: bytes):
     u, p = _imap_creds()
-    with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
-        imap.login(u, p)
+    with _imap_connect(IMAP_HOST, IMAP_PORT, u, p) as imap:
         ensure_mailbox(imap, SENT_FOLDER)
         imap.append(SENT_FOLDER, r"(\Seen)", None, raw_bytes)
         imap.logout()
@@ -760,7 +787,7 @@ def _mask_user(s: str) -> str:
         return (name[:2] + "***@" + dom)
     return s[:2] + "***"
 
-def decide_and_respond(imap: imaplib.IMAP4_SSL, msg_uid: bytes, msg_bytes: bytes):
+def decide_and_respond(imap: imaplib.IMAP4, msg_uid: bytes, msg_bytes: bytes):
     msg = BytesParser(policy=policy.default).parsebytes(msg_bytes)
     sender = decode_mime_words(msg.get("From"))
     from_addr = re.search(r"<([^>]+)>", sender or "")
@@ -868,19 +895,20 @@ def watch_imap_loop():
         "IMAP_STRICT_UNSEEN_ONLY=%s | IMAP_SINCE_DAYS=%d | IMAP_FALLBACK_LAST_N=%d | IMAP_FALLBACK_WHEN_LLM_BLOCKED=%s",
         IMAP_STRICT_UNSEEN_ONLY, IMAP_SINCE_DAYS, IMAP_FALLBACK_LAST_N, IMAP_FALLBACK_WHEN_LLM_BLOCKED
     )
+    log.info("IMAP endpoint: %s:%s (mode=%s)", IMAP_HOST, IMAP_PORT, IMAP_TLS_MODE)
     while True:
         try:
-            with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
+            u, p = _imap_creds()
+            log.info("IMAP tentando login como %s em %s:%s", _mask_user(u), IMAP_HOST, IMAP_PORT)
+            with _imap_connect(IMAP_HOST, IMAP_PORT, u, p) as imap:
                 typ, caps = imap.capability()
                 if typ == "OK" and caps:
                     try:
-                        log.debug("CAPABILITIES: %s", " ".join([c.decode() if isinstance(c, bytes) else c for c in caps]))
+                        caps_str = " ".join([c.decode() if isinstance(c, bytes) else c for c in caps])
+                        log.debug("CAPABILITIES: %s", caps_str)
                     except Exception:
                         pass
 
-                u, p = _imap_creds()
-                log.info("IMAP tentando login como %s em %s:%s", _mask_user(u), IMAP_HOST, IMAP_PORT)
-                imap.login(u, p)
                 _select_box(imap, IMAP_FOLDER_INBOX)
 
                 uids = _imap_search_unseen(imap, IMAP_SINCE_DAYS)
@@ -922,9 +950,6 @@ def watch_imap_loop():
                                 move_message_uid(imap, uid, _safe_box(FOLDER_ESCALATE))
                             except Exception:
                                 log.exception("Falha ao mover UID=%s para Escalar", uid)
-                    except Exception:
-                        log.exception("Erro ao processar UID=%s", uid)
-
                 if EXPUNGE_AFTER_COPY:
                     try: imap.expunge()
                     except Exception: log.exception("Falha no expunge final")
@@ -1076,8 +1101,7 @@ def diag_imap():
     n = int(request.args.get("n", "20"))
     try:
         u, p = _imap_creds()
-        with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
-            imap.login(u, p)
+        with _imap_connect(IMAP_HOST, IMAP_PORT, u, p) as imap:
             typ, _ = imap.select(box)
             if typ != "OK":
                 return jsonify({"error": f"não foi possível selecionar {box}"}), 500
@@ -1103,30 +1127,24 @@ def diag_imap():
         log.exception("diag/imap falhou")
         return jsonify({"error": str(e)}), 500
 
-# (NOVO) Teste explícito de autenticação IMAP
 @app.route("/diag/imap/auth")
 def diag_imap_auth():
     """
     Testa somente o login IMAP e retorna erro literal do servidor.
     Parâmetros opcionais: host, port
-    Ex.: /diag/imap/auth?host=mail.aprendacobol.com.br&port=143
+    Ex.: /diag/imap/auth?host=br1018.hostgator.com.br&port=993
     """
     host = request.args.get("host", IMAP_HOST)
     port = int(request.args.get("port", IMAP_PORT))
     u, p = _imap_creds()
     try:
-        with imaplib.IMAP4_SSL(host, port) as imap:
-            try:
-                log.info("IMAP AUTH teste como %s em %s:%s", _mask_user(u), host, port)
-                imap.login(u, p)
-                imap.logout()
-                return jsonify({"ok": True, "host": host, "port": port, "user": u})
-            except imaplib.IMAP4.error as e:
-                return jsonify({"ok": False, "host": host, "port": port, "user": u, "error": str(e)}), 401
+        with _imap_connect(host, port, u, p) as imap:
+            return jsonify({"ok": True, "host": host, "port": port, "user": u, "mode": IMAP_TLS_MODE})
+    except imaplib.IMAP4.error as e:
+        return jsonify({"ok": False, "host": host, "port": port, "user": u, "mode": IMAP_TLS_MODE, "error": str(e)}), 401
     except Exception as e:
-        return jsonify({"ok": False, "host": host, "port": port, "user": u, "error": str(e)}), 500
+        return jsonify({"ok": False, "host": host, "port": port, "user": u, "mode": IMAP_TLS_MODE, "error": str(e)}), 500
 
-# (NOVO) IP público de saída (egress)
 @app.route("/diag/net/egress")
 def diag_net_egress():
     """
@@ -1148,7 +1166,6 @@ def diag_net_egress():
             if txt and txt not in seen:
                 seen.add(txt)
                 results["sources"].append({"url": url, "value": txt, "status": r.status_code})
-                # classifica por formato
                 if ":" in txt:
                     if results["ipv6"] is None:
                         results["ipv6"] = txt
@@ -1159,7 +1176,6 @@ def diag_net_egress():
                 results["sources"].append({"url": url, "value": txt, "status": r.status_code})
         except Exception as e:
             results["sources"].append({"url": url, "error": str(e)})
-    # Também mostra IP local da interface de saída (NÃO é o público)
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(1.0)
