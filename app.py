@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # COBOL Support Agent — v10.15.5
+# Andre Richest
 
 import os
 import re
