@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# COBOL Support Agent — v10.15.5
+# COBOL Support Agent — v10.15.6
 # Andre Richest
 
 import os
@@ -22,6 +22,12 @@ from email.utils import formatdate, make_msgid
 from flask import Flask, jsonify, request
 import requests
 from requests.exceptions import RequestException
+
+# --------------------
+# App meta (definido logo no topo para evitar NameError em threads)
+# --------------------
+APP_PUBLIC_URL = os.getenv("APP_PUBLIC_URL", "")
+APP_TITLE = os.getenv("APP_TITLE", "COBOL Support Agent")
 
 # --------------------
 # Logging
@@ -72,6 +78,7 @@ _smtp_block_until_ts = 0.0
 _last_smtp_error = ""
 
 def _smtp_is_blocked_now(): return time.time() < _smtp_block_until_ts
+
 def _smtp_block(reason: str, seconds: int):
     global _smtp_block_until_ts, _last_smtp_error
     _last_smtp_error = f"{reason} (cooldown {seconds}s)"
@@ -107,6 +114,7 @@ _llm_block_until_ts = 0.0
 _last_llm_error = ""
 
 def _llm_is_blocked_now(): return LLM_HARD_DISABLE or (time.time() < _llm_block_until_ts)
+
 def _llm_block(reason: str, seconds: int):
     global _llm_block_until_ts, _last_llm_error
     _last_llm_error = f"{reason} (cooldown {seconds}s)"
@@ -116,8 +124,10 @@ def _llm_block(reason: str, seconds: int):
 # --------------------
 # Utils
 # --------------------
+
 def _safe_box(name: str) -> str:
     return name if name.upper().startswith("INBOX") else f"INBOX.{name}"
+
 
 def decode_mime_words(s):
     if not s:
@@ -127,6 +137,7 @@ def decode_mime_words(s):
     except Exception:
         return s
 
+
 def extract_text_body(msg):
     text_parts, html_parts = [], []
     if msg.is_multipart():
@@ -134,19 +145,27 @@ def extract_text_body(msg):
             ctype = part.get_content_type()
             disp = (part.get("Content-Disposition") or "").lower()
             if ctype == "text/plain" and "attachment" not in disp:
-                try: text_parts.append(part.get_content())
-                except Exception: pass
+                try:
+                    text_parts.append(part.get_content())
+                except Exception:
+                    pass
             elif ctype == "text/html" and "attachment" not in disp:
-                try: html_parts.append(part.get_content())
-                except Exception: pass
+                try:
+                    html_parts.append(part.get_content())
+                except Exception:
+                    pass
     else:
         ctype = msg.get_content_type()
         if ctype == "text/plain":
-            try: text_parts.append(msg.get_content())
-            except Exception: pass
+            try:
+                text_parts.append(msg.get_content())
+            except Exception:
+                pass
         elif ctype == "text/html":
-            try: html_parts.append(msg.get_content())
-            except Exception: pass
+            try:
+                html_parts.append(msg.get_content())
+            except Exception:
+                pass
 
     if text_parts:
         return "\n\n".join(t.strip() for t in text_parts if t)
@@ -159,6 +178,7 @@ def extract_text_body(msg):
         return re.sub(r"\n{3,}", "\n\n", text).strip()
     return ""
 
+
 def extract_cobol_attachments(msg, max_bytes=80_000):
     cobol_files = []
     if msg.is_multipart():
@@ -166,11 +186,13 @@ def extract_cobol_attachments(msg, max_bytes=80_000):
             disp = (part.get("Content-Disposition") or "").lower()
             if "attachment" in disp:
                 filename = decode_mime_words(part.get_filename())
-                if not filename: continue
+                if not filename:
+                    continue
                 if filename.lower().endswith((".cob", ".cbl", ".cpy")):
                     try:
                         data = part.get_payload(decode=True)
-                        if not data: continue
+                        if not data:
+                            continue
                         snippet = data[:max_bytes].decode("utf-8", errors="replace")
                         cobol_files.append((filename, snippet))
                     except Exception:
@@ -180,15 +202,23 @@ def extract_cobol_attachments(msg, max_bytes=80_000):
 # --------------------
 # OpenRouter client
 # --------------------
+
 def _post_openrouter(payload):
+    # Evita NameError se threads chamarem antes de __main__ ajustá-la
+    app_public = OPENROUTER_SITE_URL or os.getenv("APP_PUBLIC_URL", APP_PUBLIC_URL) or ""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "HTTP-Referer": OPENROUTER_SITE_URL or APP_PUBLIC_URL or "",
+        "HTTP-Referer": app_public,
         "X-Title": OPENROUTER_APP_NAME,
     }
-    return requests.post("https://openrouter.ai/api/v1/chat/completions",
-                         headers=headers, data=json.dumps(payload), timeout=OPENROUTER_TIMEOUT)
+    return requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=headers,
+        data=json.dumps(payload),
+        timeout=OPENROUTER_TIMEOUT,
+    )
+
 
 def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
     if _llm_is_blocked_now():
@@ -216,12 +246,12 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
                             "assunto": {"type": "string"},
                             "corpo_markdown": {"type": "string"},
                             "nivel_confianca": {"type": "number"},
-                            "acao": {"type": "string", "enum": ["responder", "escalar"]}
+                            "acao": {"type": "string", "enum": ["responder", "escalar"]},
                         },
                         "required": ["assunto", "corpo_markdown", "nivel_confianca", "acao"],
-                        "additionalProperties": False
-                    }
-                }
+                        "additionalProperties": False,
+                    },
+                },
             }]
             p["tool_choice"] = "required"
             p["response_format"] = {"type": "json_object"}
@@ -292,29 +322,38 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
             pass
 
     content = content.replace("```json", "```").strip("`").strip()
+
     def _first_json_object(s: str):
         start = s.find("{")
         while start != -1:
-            depth = 0; in_str = False; esc = False
+            depth = 0
+            in_str = False
+            esc = False
             for i in range(start, len(s)):
                 ch = s[i]
                 if in_str:
-                    if esc: esc = False
-                    elif ch == "\\": esc = True
-                    elif ch == '"': in_str = False
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
                 else:
-                    if ch == '"': in_str = True
-                    elif ch == "{": depth += 1
+                    if ch == '"':
+                        in_str = True
+                    elif ch == "{":
+                        depth += 1
                     elif ch == "}":
                         depth -= 1
                         if depth == 0:
-                            candidate = s[start:i+1]
+                            candidate = s[start : i + 1]
                             try:
                                 return json.loads(candidate)
                             except Exception:
                                 break
             start = s.find("{", start + 1)
         return None
+
     obj = _first_json_object(content)
     if obj is not None:
         return obj
@@ -323,25 +362,34 @@ def call_openrouter(system_prompt: str, user_prompt: str) -> dict:
 # --------------------
 # SMTP helpers
 # --------------------
+
 def _parse_smtp_hosts(env_value: str):
-    if not env_value: return []
+    if not env_value:
+        return []
     items = []
-    raw = env_value.replace(';', ',').replace('\n', ' ')
+    raw = env_value.replace(";", ",").replace("\n", " ")
     for token in raw.split(','):
         token = token.strip()
-        if not token: continue
+        if not token:
+            continue
         for t in token.split():
             t = t.strip()
-            if t: items.append(t)
+            if t:
+                items.append(t)
     seen, uniq = set(), []
     for h in items:
-        if h not in seen: uniq.append(h); seen.add(h)
+        if h not in seen:
+            uniq.append(h)
+            seen.add(h)
     return uniq
+
 
 def _effective_smtp_hosts():
     hosts = _parse_smtp_hosts(SMTP_HOSTS)
-    if not hosts and SMTP_HOST: hosts = [SMTP_HOST]
+    if not hosts and SMTP_HOST:
+        hosts = [SMTP_HOST]
     return hosts
+
 
 def _can_resolve_host(host: str):
     try:
@@ -350,19 +398,26 @@ def _can_resolve_host(host: str):
     except socket.gaierror:
         return False
 
+
 def _is_temporary_smtp_error(exc: Exception) -> bool:
-    if isinstance(exc, (smtplib.SMTPServerDisconnected,
-                        smtplib.SMTPConnectError,
-                        smtplib.SMTPDataError,
-                        smtplib.SMTPHeloError,
-                        smtplib.SMTPAuthenticationError,
-                        TimeoutError,
-                        socket.timeout,
-                        ConnectionRefusedError)):
+    if isinstance(
+        exc,
+        (
+            smtplib.SMTPServerDisconnected,
+            smtplib.SMTPConnectError,
+            smtplib.SMTPDataError,
+            smtplib.SMTPHeloError,
+            smtplib.SMTPAuthenticationError,
+            TimeoutError,
+            socket.timeout,
+            ConnectionRefusedError,
+        ),
+    ):
         return True
     if isinstance(exc, socket.gaierror):
         return False
     return True
+
 
 def _resolve_endpoints(host: str, port: int, prefer_ipv4: bool):
     families = [socket.AF_INET] if prefer_ipv4 else [socket.AF_UNSPEC]
@@ -377,6 +432,7 @@ def _resolve_endpoints(host: str, port: int, prefer_ipv4: bool):
         endpoints.sort(key=lambda x: 0 if x[0] == socket.AF_INET else 1)
     return endpoints
 
+
 def _dial_smtp_endpoint(host: str, port: int, mode: str, timeout: int, ctx: ssl.SSLContext):
     endpoints = _resolve_endpoints(host, port, SMTP_PREFER_IPV4)
     if not endpoints:
@@ -387,7 +443,6 @@ def _dial_smtp_endpoint(host: str, port: int, mode: str, timeout: int, ctx: ssl.
         try:
             sock = socket.socket(family, socktype, proto)
             sock.settimeout(timeout)
-            t0 = time.time()
             sock.connect(sockaddr)
             if mode == "ssl":
                 ssl_sock = ctx.wrap_socket(sock, server_hostname=host)
@@ -411,12 +466,15 @@ def _dial_smtp_endpoint(host: str, port: int, mode: str, timeout: int, ctx: ssl.
         except Exception as e:
             last_exc = e
             try:
-                if sock: sock.close()
+                if sock:
+                    sock.close()
             except Exception:
                 pass
             continue
-    if last_exc: raise last_exc
+    if last_exc:
+        raise last_exc
     raise RuntimeError("Falha desconhecida no dial SMTP")
+
 
 def _smtp_connect_with_fallback():
     if _smtp_is_blocked_now():
@@ -430,7 +488,8 @@ def _smtp_connect_with_fallback():
     attempts = [(h, SMTP_PORT, SMTP_TLS_MODE) for h in hosts]
     for item in (SMTP_FALLBACKS or "").split(","):
         item = item.strip()
-        if not item: continue
+        if not item:
+            continue
         try:
             port_str, mode = item.split(":", 1)
             port = int(port_str)
@@ -457,31 +516,40 @@ def _smtp_connect_with_fallback():
         except Exception as e:
             last_err = e
             if s:
-                try: s.quit()
+                try:
+                    s.quit()
                 except Exception:
-                    try: s.close()
-                    except Exception: pass
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
             if _is_temporary_smtp_error(e):
                 had_temp = True
             continue
 
     if had_temp:
-        _smtp_block(f"Todas as tentativas SMTP falharam (temporárias). Último: {last_err}", SMTP_COOLDOWN_SECONDS)
+        _smtp_block(
+            f"Todas as tentativas SMTP falharam (temporárias). Último: {last_err}",
+            SMTP_COOLDOWN_SECONDS,
+        )
         raise RuntimeError(f"SMTP temporariamente indisponível: {last_err}")
     raise RuntimeError(f"Falha de configuração/DNS em SMTP: {last_err}")
 
 # --------------------
 # E-mail construction
 # --------------------
+
 def ensure_reply_prefix(subject: str) -> str:
-    if not subject: return "Re:"
+    if not subject:
+        return "Re:"
     s = subject.strip()
     return s if s.lower().startswith("re:") else f"Re: {s}"
+
 
 def build_user_prompt(original_subject: str, body_text: str, cobol_files: list) -> str:
     parts = [
         f"Assunto original: {original_subject}",
-        "\nCorpo do e-mail do aluno:\n" + (body_text or "(vazio)")
+        "\nCorpo do e-mail do aluno:\n" + (body_text or "(vazio)"),
     ]
     if cobol_files:
         parts.append("\nAnexos COBOL (até 80KB cada, apenas resumo):")
@@ -494,6 +562,7 @@ def build_user_prompt(original_subject: str, body_text: str, cobol_files: list) 
     )
     return "\n".join(parts)
 
+
 def build_outgoing_body(corpo_markdown: str) -> str:
     lines = [
         corpo_markdown.strip(),
@@ -505,6 +574,7 @@ def build_outgoing_body(corpo_markdown: str) -> str:
     ]
     out = "\n".join(lines).replace("\r\n", "\n").replace("\r", "\n")
     return re.sub(r"\n{3,}", "\n\n", out)
+
 
 def _thread_headers_for(original_msg):
     headers = {}
@@ -520,6 +590,7 @@ def _thread_headers_for(original_msg):
             headers["References"] = ref_line
     return headers
 
+
 def _send_via_mailgun_api(to_addr: str, subject: str, body_text: str, extra_headers: dict) -> dict:
     if not (MAILGUN_API_KEY and MAILGUN_DOMAIN):
         raise RuntimeError("Mailgun API não configurada (defina MAILGUN_API_KEY e MAILGUN_DOMAIN).")
@@ -532,12 +603,16 @@ def _send_via_mailgun_api(to_addr: str, subject: str, body_text: str, extra_head
         "text": body_text,
     }
     for k, v in (extra_headers or {}).items():
-        if v: data[f"h:{k}"] = v
+        if v:
+            data[f"h:{k}"] = v
     r = requests.post(url, auth=auth, data=data, timeout=20)
     if r.status_code // 100 != 2:
         raise RuntimeError(f"Mailgun API HTTP {r.status_code}: {r.text[:300]}")
-    try: return r.json()
-    except Exception: return {"ok": True, "raw": r.text[:300]}
+    try:
+        return r.json()
+    except Exception:
+        return {"ok": True, "raw": r.text[:300]}
+
 
 def send_email_reply(original_msg, to_addr: str, subject: str, body_text: str) -> bytes:
     msg = EmailMessage()
@@ -567,18 +642,23 @@ def send_email_reply(original_msg, to_addr: str, subject: str, body_text: str) -
     s = _smtp_connect_with_fallback()
     try:
         refused = s.sendmail(msg["From"], [to_addr], msg.as_string())
-        if refused: raise RuntimeError(f"SMTP refused {refused}")
+        if refused:
+            raise RuntimeError(f"SMTP refused {refused}")
         log.info("E-mail enviado via SMTP para %s", to_addr)
         return msg.as_bytes()
     finally:
-        try: s.quit()
+        try:
+            s.quit()
         except Exception:
-            try: s.close()
-            except Exception: pass
+            try:
+                s.close()
+            except Exception:
+                pass
 
 # --------------------
 # IMAP helpers (SSL/STARTTLS unificado)
 # --------------------
+
 def _imap_connect(host: str, port: int, user: str, password: str):
     ctx = ssl.create_default_context()
     if IMAP_TLS_MODE == "ssl":
@@ -592,14 +672,19 @@ def _imap_connect(host: str, port: int, user: str, password: str):
         return imap
     raise RuntimeError(f"IMAP_TLS_MODE inválido: {IMAP_TLS_MODE} (use 'ssl' ou 'starttls')")
 
+
 def ensure_mailbox(imap: imaplib.IMAP4, box: str):
-    try: imap.create(box)
-    except Exception: log.debug("Mailbox pode já existir: %s", box)
+    try:
+        imap.create(box)
+    except Exception:
+        log.debug("Mailbox pode já existir: %s", box)
+
 
 def move_message_uid(imap: imaplib.IMAP4, msg_uid: bytes, dest_box: str):
     ensure_mailbox(imap, dest_box)
     imap.uid("COPY", msg_uid, dest_box)
     imap.uid("STORE", msg_uid, "+FLAGS", r"(\Deleted)")
+
 
 def append_to_sent(raw_bytes: bytes):
     u, p = _imap_creds()
@@ -609,11 +694,15 @@ def append_to_sent(raw_bytes: bytes):
         imap.append(SENT_FOLDER, r"(\Seen)", None, raw_bytes)
         log.info("Mensagem copiada para enviados: %s", SENT_FOLDER)
     finally:
-        try: imap.logout()
-        except Exception: pass
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
 
 def _extract_raw_bytes_from_fetch(msg_data):
-    if not msg_data: return None
+    if not msg_data:
+        return None
     for part in msg_data:
         if isinstance(part, tuple) and len(part) >= 2 and isinstance(part[1], (bytes, bytearray)):
             return part[1]
@@ -622,12 +711,15 @@ def _extract_raw_bytes_from_fetch(msg_data):
 # --------------------
 # Fluxo principal
 # --------------------
+
 def _mask_user(s: str) -> str:
-    if not s: return ""
+    if not s:
+        return ""
     if "@" in s:
         name, dom = s.split("@", 1)
         return (name[:2] + "***@" + dom)
     return s[:2] + "***"
+
 
 def decide_and_respond(imap: imaplib.IMAP4, msg_uid: bytes, msg_bytes: bytes):
     msg = BytesParser(policy=policy.default).parsebytes(msg_bytes)
@@ -641,11 +733,11 @@ def decide_and_respond(imap: imaplib.IMAP4, msg_uid: bytes, msg_bytes: bytes):
     try:
         AUTO_ESCALATE_FROM_REGEX = os.getenv(
             "AUTO_ESCALATE_FROM_REGEX",
-            r"(?i)(^mailer-daemon@|^postmaster@|^no[-_\. ]?reply@|^noreply@|^2fa@|@hotmart\.com(\.br)?$)"
+            r"(?i)(^mailer-daemon@|^postmaster@|^no[-_\. ]?reply@|^noreply@|^2fa@|@hotmart\.com(\.br)?$)",
         )
         AUTO_ESCALATE_SUBJECT_REGEX = os.getenv(
             "AUTO_ESCALATE_SUBJECT_REGEX",
-            r"(?i)(verification code|delivery status|failure notice|bounce|sale made|refund|payment|invoice|assinatura|pagamento atrasado|chargeback)"
+            r"(?i)(verification code|delivery status|failure notice|bounce|sale made|refund|payment|invoice|assinatura|pagamento atrasado|chargeback)",
         )
         if AUTO_ESCALATE_FROM_REGEX and re.search(AUTO_ESCALATE_FROM_REGEX, (sender or ""), re.I):
             move_message_uid(imap, msg_uid, _safe_box(FOLDER_ESCALATE))
@@ -666,7 +758,7 @@ def decide_and_respond(imap: imaplib.IMAP4, msg_uid: bytes, msg_bytes: bytes):
         "Você é um assistente do time de suporte de um curso de COBOL da Aprenda COBOL. "
         "E-mails da Hotmart ou originados com o remetente 'noreply' não devem ser respondidos. "
         "SEMPRE produza um JSON VÁLIDO e nada além disso. "
-        "{\"assunto\":\"...\",\"corpo_markdown\":\"...\",\"nivel_confianca\":0.0,\"acao\":\"responder|escalar\"} "
+        '{"assunto":"...","corpo_markdown":"...","nivel_confianca":0.0,"acao":"responder|escalar"} '
         "Regras: 1) Sem crases/```; 2) PT-BR; 3) 'nivel_confianca' 0..1; 4) 'assunto' igual ao original; 5) "
         "se claro → responder (>=0.8), se ambíguo → escalar (<=0.6). "
         "Ao final do corpo, inclua:\n- Nossa Comunidade no Telegram: https://t.me/aprendacobol\n"
@@ -685,8 +777,10 @@ def decide_and_respond(imap: imaplib.IMAP4, msg_uid: bytes, msg_bytes: bytes):
         return
 
     acao = llm_json.get("acao", "escalar")
-    try: nivel = float(llm_json.get("nivel_confianca", 0) or 0)
-    except Exception: nivel = 0.0
+    try:
+        nivel = float(llm_json.get("nivel_confianca", 0) or 0)
+    except Exception:
+        nivel = 0.0
     assunto_model = llm_json.get("assunto", original_subject or "")
     corpo_markdown = llm_json.get("corpo_markdown", "")
     should_answer = (acao == "responder") and (nivel >= CONFIDENCE_THRESHOLD)
@@ -713,19 +807,25 @@ def decide_and_respond(imap: imaplib.IMAP4, msg_uid: bytes, msg_bytes: bytes):
 # --------------------
 # Watcher IMAP (por UID)
 # --------------------
+
 def _imap_uid_search(imap, criteria: str):
     typ, data = imap.uid("search", None, criteria)
     return data[0].split() if typ == "OK" and data and data[0] else []
+
 
 def _select_box(imap, box: str):
     typ, data = imap.select(box)
     if typ != "OK":
         log.warning("Falha ao selecionar caixa %s: %s %s", box, typ, data)
 
+
 def _imap_since_date(days: int) -> str:
     dt = datetime.now(timezone.utc) - timedelta(days=days)
-    mon = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][dt.month - 1]
+    mon = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][
+        dt.month - 1
+    ]
     return f"{dt.day:02d}-{mon}-{dt.year}"
+
 
 def _imap_search_unseen(imap, since_days: int):
     if since_days and since_days > 0:
@@ -733,12 +833,18 @@ def _imap_search_unseen(imap, since_days: int):
         return _imap_uid_search(imap, f"UNSEEN SINCE {date_str}")
     return _imap_uid_search(imap, "UNSEEN")
 
+
 def watch_imap_loop():
     hosts = _effective_smtp_hosts()
     log.info("Watcher IMAP — envio primário=%s | SMTP hosts=%s", _mail_primary_transport(), hosts or "[nenhum]")
     log.info("App público em: %s", os.getenv("APP_PUBLIC_URL", ""))
-    log.info("IMAP_STRICT_UNSEEN_ONLY=%s | IMAP_SINCE_DAYS=%d | IMAP_FALLBACK_LAST_N=%d | IMAP_FALLBACK_WHEN_LLM_BLOCKED=%s",
-             IMAP_STRICT_UNSEEN_ONLY, IMAP_SINCE_DAYS, IMAP_FALLBACK_LAST_N, IMAP_FALLBACK_WHEN_LLM_BLOCKED)
+    log.info(
+        "IMAP_STRICT_UNSEEN_ONLY=%s | IMAP_SINCE_DAYS=%d | IMAP_FALLBACK_LAST_N=%d | IMAP_FALLBACK_WHEN_LLM_BLOCKED=%s",
+        IMAP_STRICT_UNSEEN_ONLY,
+        IMAP_SINCE_DAYS,
+        IMAP_FALLBACK_LAST_N,
+        IMAP_FALLBACK_WHEN_LLM_BLOCKED,
+    )
     log.info("IMAP endpoint: %s:%s (mode=%s)", IMAP_HOST, IMAP_PORT, IMAP_TLS_MODE)
 
     while True:
@@ -763,10 +869,12 @@ def watch_imap_loop():
                 if not uids and not IMAP_STRICT_UNSEEN_ONLY:
                     if not uids and not llm_blocked:
                         recent = _imap_uid_search(imap, "NEW")
-                        if recent: uids = recent
+                        if recent:
+                            uids = recent
                     if not uids and not llm_blocked:
                         recent = _imap_uid_search(imap, "RECENT")
-                        if recent: uids = recent
+                        if recent:
+                            uids = recent
                     if (not uids) and IMAP_FALLBACK_LAST_N > 0 and (not llm_blocked or IMAP_FALLBACK_WHEN_LLM_BLOCKED):
                         all_uids = _imap_uid_search(imap, "ALL")
                         tail = all_uids[-IMAP_FALLBACK_LAST_N:] if all_uids else []
@@ -806,8 +914,10 @@ def watch_imap_loop():
                     except Exception:
                         log.exception("Falha no expunge final")
             finally:
-                try: imap.logout()
-                except Exception: pass
+                try:
+                    imap.logout()
+                except Exception:
+                    pass
 
         except Exception:
             log.exception("Loop IMAP falhou")
@@ -818,24 +928,54 @@ def watch_imap_loop():
 # --------------------
 app = Flask(__name__)
 
+
 @app.route("/")
 def index():
-    return "<h3>COBOL Support Agent</h3><p>OK</p>"
+    return f"<h3>{APP_TITLE}</h3><p>OK</p>"
+
+
+# Nova rota: teste de egress (DNS + HTTP)
+@app.route("/diag/net/egress")
+def diag_net_egress():
+    out = {"dns": {}, "http": {}}
+    try:
+        out["dns"]["openrouter.ai"] = bool(socket.getaddrinfo("openrouter.ai", 443))
+        out["dns"]["mail.aprendacobol.com.br"] = bool(
+            socket.getaddrinfo("mail.aprendacobol.com.br", 993)
+        )
+    except Exception as e:
+        out["dns_error"] = str(e)
+
+    def _try_get(url, timeout=4):
+        try:
+            r = requests.get(url, timeout=timeout)
+            return {"ok": True, "status": r.status_code, "body": r.text[:120]}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    out["http"]["ipify"] = _try_get("https://api.ipify.org?format=json")
+    out["http"]["openrouter_ping"] = _try_get("https://openrouter.ai/api/v1")
+    return jsonify(out)
+
 
 @app.route("/diag/prompt")
 def diag_prompt():
     return jsonify({"note": "o hash do prompt é logado a cada e-mail processado"})
 
+
 @app.route("/diag/llm")
 def diag_llm_status():
     remaining = max(0, int(_llm_block_until_ts - time.time()))
-    return jsonify({
-        "blocked": _llm_is_blocked_now(),
-        "block_expires_in_seconds": None if LLM_HARD_DISABLE else remaining,
-        "hard_disable": os.getenv("LLM_HARD_DISABLE","false"),
-        "model": OPENROUTER_MODEL,
-        "fallback": OPENROUTER_MODEL_FALLBACK
-    })
+    return jsonify(
+        {
+            "blocked": _llm_is_blocked_now(),
+            "block_expires_in_seconds": None if LLM_HARD_DISABLE else remaining,
+            "hard_disable": os.getenv("LLM_HARD_DISABLE", "false"),
+            "model": OPENROUTER_MODEL,
+            "fallback": OPENROUTER_MODEL_FALLBACK,
+        }
+    )
+
 
 @app.route("/diag/llm/unblock", methods=["POST"])
 def diag_llm_unblock():
@@ -844,28 +984,27 @@ def diag_llm_unblock():
     _last_llm_error = ""
     return jsonify({"ok": True, "unblocked": True})
 
-def _effective_smtp_hosts():  # redef para exposição no diag
-    hosts = _parse_smtp_hosts(SMTP_HOSTS)
-    if not hosts and SMTP_HOST: hosts = [SMTP_HOST]
-    return hosts
 
 @app.route("/diag/transport/status")
 def diag_transport_status():
     remaining = max(0, int(_smtp_block_until_ts - time.time()))
-    return jsonify({
-        "primary_transport": _mail_primary_transport(),
-        "mailgun": {"configured": bool(MAILGUN_API_KEY and MAILGUN_DOMAIN), "domain": MAILGUN_DOMAIN or None},
-        "smtp": {
-            "blocked": _smtp_is_blocked_now(),
-            "block_expires_in_seconds": remaining,
-            "last_error": _last_smtp_error,
-            "hosts": _effective_smtp_hosts(),
-            "primary": {"host": SMTP_HOST or None, "port": SMTP_PORT, "mode": SMTP_TLS_MODE},
-            "fallbacks": SMTP_FALLBACKS,
-            "timeout": SMTP_TIMEOUT,
-            "prefer_ipv4": SMTP_PREFER_IPV4,
+    return jsonify(
+        {
+            "primary_transport": _mail_primary_transport(),
+            "mailgun": {"configured": bool(MAILGUN_API_KEY and MAILGUN_DOMAIN), "domain": MAILGUN_DOMAIN or None},
+            "smtp": {
+                "blocked": _smtp_is_blocked_now(),
+                "block_expires_in_seconds": remaining,
+                "last_error": _last_smtp_error,
+                "hosts": _effective_smtp_hosts(),
+                "primary": {"host": SMTP_HOST or None, "port": SMTP_PORT, "mode": SMTP_TLS_MODE},
+                "fallbacks": SMTP_FALLBACKS,
+                "timeout": SMTP_TIMEOUT,
+                "prefer_ipv4": SMTP_PREFER_IPV4,
+            },
         }
-    })
+    )
+
 
 @app.route("/diag/smtp/unblock", methods=["POST"])
 def diag_smtp_unblock():
@@ -874,16 +1013,19 @@ def diag_smtp_unblock():
     _last_smtp_error = ""
     return jsonify({"ok": True, "unblocked": True})
 
+
 @app.route("/diag/smtp/probe")
 def diag_smtp_probe():
     hosts = _effective_smtp_hosts()
     attempts = [(h, SMTP_PORT, SMTP_TLS_MODE) for h in hosts]
     for item in (SMTP_FALLBACKS or "").split(","):
         item = item.strip()
-        if not item: continue
+        if not item:
+            continue
         try:
             port_str, mode = item.split(":", 1)
-            port = int(port_str); mode = mode.strip().lower()
+            port = int(port_str)
+            mode = mode.strip().lower()
             for h in hosts:
                 if (h, port, mode) not in attempts:
                     attempts.append((h, port, mode))
@@ -896,13 +1038,16 @@ def diag_smtp_probe():
         entry = {"host": host, "port": port, "mode": mode, "ok": False}
         try:
             s = _dial_smtp_endpoint(host, port, mode, SMTP_TIMEOUT, ctx)
-            try: s.close()
-            except Exception: pass
+            try:
+                s.close()
+            except Exception:
+                pass
             entry["ok"] = True
         except Exception as e:
             entry["error"] = str(e)
         report.append(entry)
     return jsonify({"prefer_ipv4": SMTP_PREFER_IPV4, "hosts": hosts, "attempts": report})
+
 
 @app.route("/diag/email")
 def diag_email():
@@ -911,12 +1056,18 @@ def diag_email():
     body = request.args.get("body", "Olá! Teste de envio com transporte primário + fallback.\n\n— Sistema")
     try:
         raw = send_email_reply(None, to, subject, body)
-        try: append_to_sent(raw)
-        except Exception: log.exception("Falha ao copiar para enviados (opcional)")
+        try:
+            append_to_sent(raw)
+        except Exception:
+            log.exception("Falha ao copiar para enviados (opcional)")
         return jsonify({"ok": True, "to": to, "primary_transport": _mail_primary_transport()})
     except Exception as e:
         log.exception("Falha no /diag/email")
-        return jsonify({"ok": False, "error": str(e), "primary_transport": _mail_primary_transport()}), 500
+        return (
+            jsonify({"ok": False, "error": str(e), "primary_transport": _mail_primary_transport()}),
+            500,
+        )
+
 
 @app.route("/diag/imap")
 def diag_imap():
@@ -929,26 +1080,33 @@ def diag_imap():
             typ, _ = imap.select(box)
             if typ != "OK":
                 return jsonify({"error": f"não foi possível selecionar {box}"}), 500
+
             def _count(q):
                 ids = _imap_uid_search(imap, q)
                 tail = [i.decode() if isinstance(i, bytes) else i for i in ids[-n:]]
                 return len(ids), tail
+
             c_unseen, ids_unseen = _count("UNSEEN")
             c_new, ids_new = _count("NEW")
             c_recent, ids_recent = _count("RECENT")
             c_all, ids_all = _count("ALL")
         finally:
-            try: imap.logout()
-            except Exception: pass
+            try:
+                imap.logout()
+            except Exception:
+                pass
 
-        return jsonify({
-            "box": box,
-            "counts": {"UNSEEN": c_unseen, "NEW": c_new, "RECENT": c_recent, "ALL": c_all},
-            "tail_uids": {"UNSEEN": ids_unseen, "NEW": ids_new, "RECENT": ids_recent, "ALL": ids_all},
-        })
+        return jsonify(
+            {
+                "box": box,
+                "counts": {"UNSEEN": c_unseen, "NEW": c_new, "RECENT": c_recent, "ALL": c_all},
+                "tail_uids": {"UNSEEN": ids_unseen, "NEW": ids_new, "RECENT": ids_recent, "ALL": ids_all},
+            }
+        )
     except Exception as e:
         log.exception("diag/imap falhou")
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/diag/imap/auth")
 def diag_imap_auth():
@@ -960,21 +1118,32 @@ def diag_imap_auth():
         try:
             return jsonify({"ok": True, "host": host, "port": port, "user": u, "mode": IMAP_TLS_MODE})
         finally:
-            try: imap.logout()
-            except Exception: pass
+            try:
+                imap.logout()
+            except Exception:
+                pass
     except imaplib.IMAP4.error as e:
-        return jsonify({"ok": False, "host": host, "port": port, "user": u, "mode": IMAP_TLS_MODE, "error": str(e)}), 401
+        return (
+            jsonify({"ok": False, "host": host, "port": port, "user": u, "mode": IMAP_TLS_MODE, "error": str(e)}),
+            401,
+        )
     except Exception as e:
-        return jsonify({"ok": False, "host": host, "port": port, "user": u, "mode": IMAP_TLS_MODE, "error": str(e)}), 500
+        return (
+            jsonify({"ok": False, "host": host, "port": port, "user": u, "mode": IMAP_TLS_MODE, "error": str(e)}),
+            500,
+        )
 
 # --------------------
 # Main
 # --------------------
 if __name__ == "__main__":
     import threading
+
     t = threading.Thread(target=watch_imap_loop, daemon=True)
     t.start()
+
     port = int(os.getenv("PORT", "10000"))
-    APP_PUBLIC_URL = os.getenv("APP_PUBLIC_URL", "")
+    # Releitura opcional (não necessária, mas mantida para compatibilidade)
+    APP_PUBLIC_URL = os.getenv("APP_PUBLIC_URL", APP_PUBLIC_URL)
     log.info("Iniciando Flask em 0.0.0.0:%s", port)
     app.run(host="0.0.0.0", port=port)
