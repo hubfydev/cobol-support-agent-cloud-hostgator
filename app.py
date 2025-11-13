@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# COBOL Support Agent — v10.16
+# COBOL Support Agent — v10.17
 # Andre Richest
 
 import os
@@ -250,10 +250,18 @@ def send_test_email(to_addr: str, subject: str, body: str) -> str:
 # -------------------------------------------------------------
 
 def watch_imap_loop():
-    log.info(f"IMAP_STRICT_UNSEEN_ONLY={IMAP_STRICT_UNSEEN_ONLY} | IMAP_SINCE_DAYS={IMAP_SINCE_DAYS} | IMAP_FALLBACK_LAST_N={IMAP_FALLBACK_LAST_N} | IMAP_FALLBACK_WHEN_LLM_BLOCKED={IMAP_FALLBACK_WHEN_LLM_BLOCKED}")
+    log.info(
+        f"IMAP_STRICT_UNSEEN_ONLY={IMAP_STRICT_UNSEEN_ONLY} | "
+        f"IMAP_SINCE_DAYS={IMAP_SINCE_DAYS} | "
+        f"IMAP_FALLBACK_LAST_N={IMAP_FALLBACK_LAST_N} | "
+        f"IMAP_FALLBACK_WHEN_LLM_BLOCKED={IMAP_FALLBACK_WHEN_LLM_BLOCKED}"
+    )
     while True:
         try:
-            log.info(f"IMAP tentando login como {IMAP_USER[:2]}***@ em {IMAP_HOST}:{IMAP_PORT} (mode={IMAP_TLS_MODE})")
+            log.info(
+                f"IMAP tentando login como {IMAP_USER[:2]}***@ "
+                f"em {IMAP_HOST}:{IMAP_PORT} (mode={IMAP_TLS_MODE})"
+            )
             imap = imap_connect(IMAP_HOST, IMAP_PORT, IMAP_USER, IMAP_PASS, IMAP_TLS_MODE)
             try:
                 typ, _ = imap.select(IMAP_FOLDER_INBOX)
@@ -320,9 +328,23 @@ def diag_imap_auth():
                 pass
         return jsonify({"ok": True, "host": host, "port": port, "mode": mode, "user": user})
     except ImapAuthError as e:
-        return jsonify({"ok": False, "host": host, "port": port, "mode": mode, "user": user, "error": str(e)}), 401
+        return jsonify({
+            "ok": False,
+            "host": host,
+            "port": port,
+            "mode": mode,
+            "user": user,
+            "error": str(e)
+        }), 401
     except Exception as e:
-        return jsonify({"ok": False, "host": host, "port": port, "mode": mode, "user": user, "error": str(e)}) , 500
+        return jsonify({
+            "ok": False,
+            "host": host,
+            "port": port,
+            "mode": mode,
+            "user": user,
+            "error": str(e)
+        }), 500
 
 
 @app.get("/diag/smtp/auth")
@@ -333,38 +355,134 @@ def diag_smtp_auth():
     user = request.args.get("user") or SMTP_USER
     password = request.args.get("pass") or SMTP_PASS
 
+    # Caminho 1: testar host/port fornecidos explicitamente
     if host and port:
         try:
             s = smtp_connect_once(host, int(port), mode)
             try:
-                # quick noop test
                 code = s.noop()[0]
             finally:
                 try:
                     s.quit()
                 except Exception:
                     pass
-            return jsonify({"ok": True, "host": host, "port": int(port), "mode": mode, "user": user, "code": int(code)})
+            return jsonify({
+                "ok": True,
+                "host": host,
+                "port": int(port),
+                "mode": mode,
+                "user": user,
+                "code": int(code),
+            })
         except smtplib.SMTPAuthenticationError as e:
-            return jsonify({"ok": False, "host": host, "port": int(port), "mode": mode, "user": user, "error": f"SMTP AUTH failed: {e}"}), 401
+            return jsonify({
+                "ok": False,
+                "host": host,
+                "port": int(port),
+                "mode": mode,
+                "user": user,
+                "error": f"SMTP AUTH failed: {e}",
+            }), 401
         except Exception as e:
-            return jsonify({"ok": False, "host": host, "port": int(port), "mode": mode, "user": user, "error": str(e)}) , 500
-    else:
-        # Use configured hosts/port/mode with fallback chain
+            return jsonify({
+                "ok": False,
+                "host": host,
+                "port": int(port),
+                "mode": mode,
+                "user": user,
+                "error": str(e),
+            }), 500
+
+    # Caminho 2: usar configuração padrão + fallback
+    try:
+        s = smtp_connect_with_fallback()
         try:
-            s = smtp_connect_with_fallback()
+            code = s.noop()[0]
+        finally:
             try:
-                code = s.noop()[0]
-            finally:
-                try:
-                    s.quit()
-                except Exception:
-                    pass
-            return jsonify({"ok": True, "hosts": SMTP_HOSTS or [SMTP_HOST], "port": SMTP_PORT, "mode": SMTP_TLS_MODE, "fallbacks": SMTP_FALLBACKS, "user": user, "code": int(code)})
-        except smtplib.SMTPAuthenticationError as e:
-            return jsonify({"ok": False, "hosts": SMTP_HOSTS or [SMTP_HOST], "port": SMTP_PORT, "mode": SMTP_TLS_MODE, "fallbacks": SMTP_FALLBACKS, "user": user, "error": f"SMTP AUTH failed: {e}"}), 401
-        except Exception as e:
-            return jsonify({"ok": False, "hosts": SMTP_HOSTS or [SMTP_HOST], "port": SMTP_PORT, "mode": SMTP_TLS_MODE, "fallbacks": SMTP_FALLBACKS, "user": user, "error": str(e)}) , 500
+                s.quit()
+            except Exception:
+                pass
+        return jsonify({
+            "ok": True,
+            "hosts": SMTP_HOSTS or [SMTP_HOST],
+            "port": SMTP_PORT,
+            "mode": SMTP_TLS_MODE,
+            "fallbacks": SMTP_FALLBACKS,
+            "user": user,
+            "code": int(code),
+        })
+    except smtplib.SMTPAuthenticationError as e:
+        return jsonify({
+            "ok": False,
+            "hosts": SMTP_HOSTS or [SMTP_HOST],
+            "port": SMTP_PORT,
+            "mode": SMTP_TLS_MODE,
+            "fallbacks": SMTP_FALLBACKS,
+            "user": user,
+            "error": f"SMTP AUTH failed: {e}",
+        }), 401
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "hosts": SMTP_HOSTS or [SMTP_HOST],
+            "port": SMTP_PORT,
+            "mode": SMTP_TLS_MODE,
+            "fallbacks": SMTP_FALLBACKS,
+            "user": user,
+            "error": str(e),
+        }), 500
+
+
+@app.get("/diag/smtp/ehlo")
+def diag_smtp_ehlo():
+    """
+    Diagnóstico baixo nível do servidor SMTP:
+    - conecta usando host/port/mode
+    - executa EHLO e retorna o código e features.
+    """
+    host = request.args.get("host") or (SMTP_HOSTS[0] if SMTP_HOSTS else SMTP_HOST)
+    port = int(request.args.get("port") or SMTP_PORT)
+    mode = (request.args.get("mode") or SMTP_TLS_MODE).lower()
+
+    try:
+        if mode == "ssl":
+            s = smtplib.SMTP_SSL(host, port, timeout=SMTP_CONNECT_TIMEOUT, context=_ssl_context())
+        else:
+            s = smtplib.SMTP(host, port, timeout=SMTP_CONNECT_TIMEOUT)
+            if mode == "starttls":
+                s.starttls(context=_ssl_context())
+
+        code, msg = s.ehlo()
+        try:
+            s.quit()
+        except Exception:
+            pass
+
+        # msg pode vir como bytes
+        if isinstance(msg, bytes):
+            msg_text = msg.decode(errors="ignore")
+        else:
+            msg_text = str(msg)
+
+        features = [line.strip() for line in msg_text.splitlines() if line.strip()]
+
+        return jsonify({
+            "ok": True,
+            "host": host,
+            "port": port,
+            "mode": mode,
+            "code": int(code),
+            "features": features,
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "host": host,
+            "port": port,
+            "mode": mode,
+            "error": str(e),
+        }), 500
 
 
 # -------------------------------------------------------------
