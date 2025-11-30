@@ -1,7 +1,6 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# COBOL Support Agent — v10.17
+# COBOL Support Agent — v10.18
 # Andre Richest
 
 import os
@@ -52,21 +51,30 @@ EXPUNGE_AFTER_COPY = os.getenv("EXPUNGE_AFTER_COPY", "true").lower() == "true"
 
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
 
+# --- SMTP (Mailgun-friendly defaults) ---
 SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_HOSTS = [h.strip() for h in os.getenv("SMTP_HOSTS", SMTP_HOST).split(",") if h.strip()]
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
-SMTP_TLS_MODE = os.getenv("SMTP_TLS_MODE", "ssl").lower()  # ssl | starttls
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))  # Mailgun recomenda 587
+SMTP_TLS_MODE = os.getenv("SMTP_TLS_MODE", "starttls").lower()  # ssl | starttls
 SMTP_USER = os.getenv("MAIL_USER", os.getenv("SMTP_USER", ""))
 SMTP_PASS = os.getenv("SMTP_PASS", os.getenv("MAIL_PASS", ""))
 SMTP_CONNECT_TIMEOUT = int(os.getenv("SMTP_CONNECT_TIMEOUT", "10"))
 SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", "20"))
 SMTP_PREFER_IPV4 = os.getenv("SMTP_PREFER_IPV4", "true").lower() == "true"
-SMTP_FALLBACKS = os.getenv("SMTP_FALLBACKS", "465:ssl")  # e.g. "465:ssl,587:starttls"
+
+# Fallbacks pensados para Mailgun: 587 (starttls), 465 (ssl), 2525 (starttls)
+SMTP_FALLBACKS = os.getenv("SMTP_FALLBACKS", "587:starttls,465:ssl,2525:starttls")
+
 SMTP_COOLDOWN_SECONDS = int(os.getenv("SMTP_COOLDOWN_SECONDS", "900"))
 
 SIGNATURE_NAME = os.getenv("SIGNATURE_NAME", "Equipe Aprenda COBOL — Suporte")
 SIGNATURE_FOOTER = os.getenv("SIGNATURE_FOOTER", "")
 SIGNATURE_LINKS = os.getenv("SIGNATURE_LINKS", "")
+
+# From / Reply-To configuráveis (especialmente útil com Mailgun)
+SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", SMTP_USER or "")
+SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", SIGNATURE_NAME)
+SMTP_REPLY_TO = os.getenv("SMTP_REPLY_TO", SMTP_FROM_EMAIL)
 
 APP_TITLE = os.getenv("APP_TITLE", "COBOL Support Agent")
 
@@ -75,7 +83,7 @@ APP_TITLE = os.getenv("APP_TITLE", "COBOL Support Agent")
 # -------------------------------------------------------------
 
 def _resolve_host(host: str) -> List[str]:
-    """Resolve hostnames to IPs; optionally prefer IPv4."""
+    """Resolve hostnames to IPs; opcionalmente prefere IPv4 (apenas para log/debug)."""
     try:
         family = socket.AF_INET if SMTP_PREFER_IPV4 else socket.AF_UNSPEC
         infos = socket.getaddrinfo(host, None, family, socket.SOCK_STREAM)
@@ -146,29 +154,32 @@ _last_smtp_fail_ts: Optional[float] = None
 
 
 def smtp_connect_once(host: str, port: int, mode: str) -> smtplib.SMTP:
+    """
+    Conecta em um único host/porta/mode usando o hostname para TLS/SNI.
+    """
     mode = (mode or "ssl").lower()
     addrs = _resolve_host(host)
     log.info(f"SMTP tentativa — {host} -> {addrs}, port={port}, mode={mode}")
 
-    for addr in addrs:
-        try:
-            if mode == "ssl":
-                s = smtplib.SMTP_SSL(addr, port, timeout=SMTP_CONNECT_TIMEOUT, context=_ssl_context())
-            else:
-                s = smtplib.SMTP(addr, port, timeout=SMTP_CONNECT_TIMEOUT)
-                if mode == "starttls":
-                    s.starttls(context=_ssl_context())
-            s.login(SMTP_USER, SMTP_PASS)
-            s.timeout = SMTP_TIMEOUT
-            log.info(f"SMTP conectado via {addr}:{port} ({mode})")
-            return s
-        except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, socket.timeout) as e:
-            log.warning(f"SMTP connect falhou em {addr}:{port} ({mode}) — {e}")
-        except smtplib.SMTPAuthenticationError as e:
-            log.error(f"SMTP AUTH falhou em {addr}:{port} ({mode}) — {e}")
-            raise
-        except Exception as e:
-            log.warning(f"SMTP erro em {addr}:{port} ({mode}) — {e}")
+    try:
+        if mode == "ssl":
+            s = smtplib.SMTP_SSL(host, port, timeout=SMTP_CONNECT_TIMEOUT, context=_ssl_context())
+        else:
+            s = smtplib.SMTP(host, port, timeout=SMTP_CONNECT_TIMEOUT)
+            if mode == "starttls":
+                s.starttls(context=_ssl_context())
+        s.login(SMTP_USER, SMTP_PASS)
+        s.timeout = SMTP_TIMEOUT
+        log.info(f"SMTP conectado via {host}:{port} ({mode})")
+        return s
+    except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, socket.timeout) as e:
+        log.warning(f"SMTP connect falhou em {host}:{port} ({mode}) — {e}")
+    except smtplib.SMTPAuthenticationError as e:
+        log.error(f"SMTP AUTH falhou em {host}:{port} ({mode}) — {e}")
+        raise
+    except Exception as e:
+        log.warning(f"SMTP erro em {host}:{port} ({mode}) — {e}")
+
     raise SmtpTempError("Todas as tentativas SMTP falharam (temporárias)")
 
 
@@ -199,7 +210,7 @@ def smtp_connect_with_fallback() -> smtplib.SMTP:
     except Exception as e:
         log.warning(f"SMTP primário indisponível: {e}")
 
-    # fallbacks: "465:ssl,587:starttls"
+    # fallbacks: ex. "587:starttls,465:ssl,2525:starttls"
     for item in [x.strip() for x in SMTP_FALLBACKS.split(',') if x.strip()]:
         try:
             p, m = item.split(':', 1)
@@ -229,14 +240,34 @@ def smtp_connect_with_fallback() -> smtplib.SMTP:
 # Minimal mail actions (stub for reply flow)
 # -------------------------------------------------------------
 
+def _build_from_header() -> str:
+    """
+    Monta o cabeçalho From usando FROM_NAME + FROM_EMAIL.
+    Cai para SMTP_USER se FROM_EMAIL não estiver configurado.
+    """
+    email = SMTP_FROM_EMAIL or SMTP_USER
+    name = (SMTP_FROM_NAME or "").strip()
+
+    if email and name:
+        return f"{name} <{email}>"
+    return email or ""
+
+
 def send_test_email(to_addr: str, subject: str, body: str) -> str:
     s = smtp_connect_with_fallback()
     try:
         msg = EmailMessage()
-        msg["From"] = SMTP_USER
+        from_header = _build_from_header()
+        if from_header:
+            msg["From"] = from_header
+        if SMTP_REPLY_TO:
+            msg["Reply-To"] = SMTP_REPLY_TO
+
         msg["To"] = to_addr
         msg["Subject"] = subject
-        msg.set_content(body + f"\n\n{SIGNATURE_NAME}\n{SIGNATURE_FOOTER}\n{SIGNATURE_LINKS}")
+        msg.set_content(
+            body + f"\n\n{SIGNATURE_NAME}\n{SIGNATURE_FOOTER}\n{SIGNATURE_LINKS}"
+        )
         s.send_message(msg)
         return "ok"
     finally:
@@ -304,6 +335,8 @@ def root():
             "mode": SMTP_TLS_MODE,
             "user": SMTP_USER,
             "fallbacks": SMTP_FALLBACKS,
+            "from_email": SMTP_FROM_EMAIL,
+            "from_name": SMTP_FROM_NAME,
         }
     })
 
