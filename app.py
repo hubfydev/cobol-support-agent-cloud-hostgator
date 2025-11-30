@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# COBOL Support Agent — v10.18
+# COBOL Support Agent — v10.19
 # Andre Richest
 
 import os
@@ -15,6 +15,8 @@ from typing import Optional, Tuple, List
 import imaplib
 import smtplib
 from email.message import EmailMessage
+
+import requests  # <-- Mailgun API
 
 from flask import Flask, jsonify, request
 
@@ -51,7 +53,7 @@ EXPUNGE_AFTER_COPY = os.getenv("EXPUNGE_AFTER_COPY", "true").lower() == "true"
 
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
 
-# --- SMTP (Mailgun-friendly defaults) ---
+# --- SMTP (mantido, mas hoje bloqueado pela Render) ---
 SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_HOSTS = [h.strip() for h in os.getenv("SMTP_HOSTS", SMTP_HOST).split(",") if h.strip()]
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))  # Mailgun recomenda 587
@@ -61,29 +63,30 @@ SMTP_PASS = os.getenv("SMTP_PASS", os.getenv("MAIL_PASS", ""))
 SMTP_CONNECT_TIMEOUT = int(os.getenv("SMTP_CONNECT_TIMEOUT", "10"))
 SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", "20"))
 SMTP_PREFER_IPV4 = os.getenv("SMTP_PREFER_IPV4", "true").lower() == "true"
-
-# Fallbacks pensados para Mailgun: 587 (starttls), 465 (ssl), 2525 (starttls)
 SMTP_FALLBACKS = os.getenv("SMTP_FALLBACKS", "587:starttls,465:ssl,2525:starttls")
-
 SMTP_COOLDOWN_SECONDS = int(os.getenv("SMTP_COOLDOWN_SECONDS", "900"))
 
 SIGNATURE_NAME = os.getenv("SIGNATURE_NAME", "Equipe Aprenda COBOL — Suporte")
 SIGNATURE_FOOTER = os.getenv("SIGNATURE_FOOTER", "")
 SIGNATURE_LINKS = os.getenv("SIGNATURE_LINKS", "")
 
-# From / Reply-To configuráveis (especialmente útil com Mailgun)
 SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", SMTP_USER or "")
 SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", SIGNATURE_NAME)
 SMTP_REPLY_TO = os.getenv("SMTP_REPLY_TO", SMTP_FROM_EMAIL)
 
 APP_TITLE = os.getenv("APP_TITLE", "COBOL Support Agent")
 
+# --- Mailgun API ---
+MAILGUN_API_KEY = os.getenv("MAILGUN_API_KEY", "")
+MAILGUN_DOMAIN = os.getenv("MAILGUN_DOMAIN", "")
+MAILGUN_API_BASE = os.getenv("MAILGUN_API_BASE", "https://api.mailgun.net/v3")
+
 # -------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------
 
 def _resolve_host(host: str) -> List[str]:
-    """Resolve hostnames to IPs; opcionalmente prefere IPv4 (apenas para log/debug)."""
+    """Resolve hostnames to IPs; opcionalmente prefere IPv4 (só para log)."""
     try:
         family = socket.AF_INET if SMTP_PREFER_IPV4 else socket.AF_UNSPEC
         infos = socket.getaddrinfo(host, None, family, socket.SOCK_STREAM)
@@ -99,7 +102,6 @@ def _resolve_host(host: str) -> List[str]:
 
 def _ssl_context() -> ssl.SSLContext:
     ctx = ssl.create_default_context()
-    # Be strict; do not disable cert verification in production
     ctx.check_hostname = True
     ctx.verify_mode = ssl.CERT_REQUIRED
     return ctx
@@ -156,6 +158,7 @@ _last_smtp_fail_ts: Optional[float] = None
 def smtp_connect_once(host: str, port: int, mode: str) -> smtplib.SMTP:
     """
     Conecta em um único host/porta/mode usando o hostname para TLS/SNI.
+    (Hoje deve falhar por bloqueio de porta na Render.)
     """
     mode = (mode or "ssl").lower()
     addrs = _resolve_host(host)
@@ -186,7 +189,6 @@ def smtp_connect_once(host: str, port: int, mode: str) -> smtplib.SMTP:
 def smtp_connect_with_fallback() -> smtplib.SMTP:
     global _last_smtp_fail_ts
 
-    # cooldown
     if _last_smtp_fail_ts is not None:
         remaining = int(SMTP_COOLDOWN_SECONDS - (time.time() - _last_smtp_fail_ts))
         if remaining > 0:
@@ -194,7 +196,6 @@ def smtp_connect_with_fallback() -> smtplib.SMTP:
         else:
             _last_smtp_fail_ts = None
 
-    # primary attempt: configured mode/port
     try:
         if SMTP_HOSTS:
             for host in SMTP_HOSTS:
@@ -205,12 +206,10 @@ def smtp_connect_with_fallback() -> smtplib.SMTP:
         else:
             return smtp_connect_once(SMTP_HOST, SMTP_PORT, SMTP_TLS_MODE)
     except smtplib.SMTPAuthenticationError:
-        # auth error is permanent until cred fix — não entra em fallback de modo/porta
         raise
     except Exception as e:
         log.warning(f"SMTP primário indisponível: {e}")
 
-    # fallbacks: ex. "587:starttls,465:ssl,2525:starttls"
     for item in [x.strip() for x in SMTP_FALLBACKS.split(',') if x.strip()]:
         try:
             p, m = item.split(':', 1)
@@ -237,23 +236,60 @@ def smtp_connect_with_fallback() -> smtplib.SMTP:
 
 
 # -------------------------------------------------------------
-# Minimal mail actions (stub for reply flow)
+# Mailgun API send
 # -------------------------------------------------------------
 
 def _build_from_header() -> str:
-    """
-    Monta o cabeçalho From usando FROM_NAME + FROM_EMAIL.
-    Cai para SMTP_USER se FROM_EMAIL não estiver configurado.
-    """
     email = SMTP_FROM_EMAIL or SMTP_USER
     name = (SMTP_FROM_NAME or "").strip()
-
     if email and name:
         return f"{name} <{email}>"
     return email or ""
 
 
+def send_via_mailgun_api(to_addr: str, subject: str, body: str) -> str:
+    if not MAILGUN_API_KEY or not MAILGUN_DOMAIN:
+        raise RuntimeError("Mailgun API não configurada (MAILGUN_API_KEY/MAILGUN_DOMAIN)")
+
+    from_header = _build_from_header()
+    text_body = body + f"\n\n{SIGNATURE_NAME}\n{SIGNATURE_FOOTER}\n{SIGNATURE_LINKS}"
+
+    url = f"{MAILGUN_API_BASE.rstrip('/')}/{MAILGUN_DOMAIN}/messages"
+    data = {
+        "from": from_header,
+        "to": [to_addr],
+        "subject": subject,
+        "text": text_body,
+    }
+    if SMTP_REPLY_TO:
+        data["h:Reply-To"] = SMTP_REPLY_TO
+
+    log.info(f"Mailgun API POST {url} -> to={to_addr}")
+    resp = requests.post(
+        url,
+        auth=("api", MAILGUN_API_KEY),
+        data=data,
+        timeout=SMTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+    log.info(f"Mailgun API resposta {resp.status_code}: {resp.text[:200]}")
+    return "ok"
+
+
+# -------------------------------------------------------------
+# Minimal mail actions (stub for reply flow)
+# -------------------------------------------------------------
+
 def send_test_email(to_addr: str, subject: str, body: str) -> str:
+    """
+    Envia e-mail. Prioridade:
+    1) Mailgun API (porta 443, deve funcionar na Render)
+    2) SMTP (mantido como fallback, mas hoje bloqueado)
+    """
+    if MAILGUN_API_KEY and MAILGUN_DOMAIN:
+        return send_via_mailgun_api(to_addr, subject, body)
+
+    # fallback SMTP (provavelmente não vai funcionar na Render, mas fica para compatibilidade)
     s = smtp_connect_with_fallback()
     try:
         msg = EmailMessage()
@@ -337,6 +373,11 @@ def root():
             "fallbacks": SMTP_FALLBACKS,
             "from_email": SMTP_FROM_EMAIL,
             "from_name": SMTP_FROM_NAME,
+        },
+        "mailgun": {
+            "domain": MAILGUN_DOMAIN,
+            "api_base": MAILGUN_API_BASE,
+            "api_configured": bool(MAILGUN_API_KEY and MAILGUN_DOMAIN),
         }
     })
 
@@ -383,13 +424,13 @@ def diag_imap_auth():
 
 @app.get("/diag/smtp/auth")
 def diag_smtp_auth():
+    # Mantido para debug, mas provavelmente vai continuar dando timeout na Render.
     host = request.args.get("host")
     port = request.args.get("port")
     mode = (request.args.get("mode") or SMTP_TLS_MODE).lower()
     user = request.args.get("user") or SMTP_USER
     password = request.args.get("pass") or SMTP_PASS
 
-    # Caminho 1: testar host/port fornecidos explicitamente
     if host and port:
         try:
             s = smtp_connect_once(host, int(port), mode)
@@ -427,7 +468,6 @@ def diag_smtp_auth():
                 "error": str(e),
             }), 500
 
-    # Caminho 2: usar configuração padrão + fallback
     try:
         s = smtp_connect_with_fallback()
         try:
@@ -470,11 +510,6 @@ def diag_smtp_auth():
 
 @app.get("/diag/smtp/ehlo")
 def diag_smtp_ehlo():
-    """
-    Diagnóstico baixo nível do servidor SMTP:
-    - conecta usando host/port/mode
-    - executa EHLO e retorna o código e features.
-    """
     host = request.args.get("host") or (SMTP_HOSTS[0] if SMTP_HOSTS else SMTP_HOST)
     port = int(request.args.get("port") or SMTP_PORT)
     mode = (request.args.get("mode") or SMTP_TLS_MODE).lower()
@@ -493,7 +528,6 @@ def diag_smtp_ehlo():
         except Exception:
             pass
 
-        # msg pode vir como bytes
         if isinstance(msg, bytes):
             msg_text = msg.decode(errors="ignore")
         else:
@@ -515,6 +549,28 @@ def diag_smtp_ehlo():
             "host": host,
             "port": port,
             "mode": mode,
+            "error": str(e),
+        }), 500
+
+
+@app.get("/diag/mailgun/api")
+def diag_mailgun_api():
+    """
+    Envia um e-mail de teste via Mailgun API para validar conectividade HTTP.
+    """
+    to_addr = request.args.get("to") or (SMTP_FROM_EMAIL or IMAP_USER)
+    try:
+        send_via_mailgun_api(to_addr, "Teste Mailgun API", "Envio de teste via Mailgun API.")
+        return jsonify({
+            "ok": True,
+            "to": to_addr,
+            "domain": MAILGUN_DOMAIN,
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "to": to_addr,
+            "domain": MAILGUN_DOMAIN,
             "error": str(e),
         }), 500
 
