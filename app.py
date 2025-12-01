@@ -270,9 +270,9 @@ def _default_reply_dict(subject: str) -> dict:
     """
     corpo = (
         "Olá!\n\n"
-        "Recebemos o seu e-mail sobre COBOL. Esta é uma resposta automática de teste, "
-        "pois nosso assistente inteligente não está disponível no momento.\n\n"
-        "Em breve, você receberá uma resposta mais detalhada.\n"
+        "Somos do time de suporte e confirmamos que recebemos o seu e-mail. Estamos com um backlog grande de mensagens, "
+        "e vamos tratar cada uma com muita atenção, portanto agradecemos sua compreensão se demorar um pouco sua resposta.\n\n"
+        "Queremos dar à você a nossa melhor atenção.\n"
         "\n"
         "- Nossa Comunidade no Telegram: https://t.me/aprendacobol\n"
         "- Conheça a Formação Completa de Programador COBOL: https://assinatura.aprendacobol.com.br"
