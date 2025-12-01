@@ -905,7 +905,7 @@ def diag_imap_auth():
         try:
             typ, _ = imap.select(IMAP_FOLDER_INBOX)
             if typ != 'OK':
-                raise RuntimeError(f"SELECT IMAP_FOLDER_INBOX} falhou: {typ}")
+                                raise RuntimeError(f"SELECT {IMAP_FOLDER_INBOX} falhou: {typ}")
         finally:
             try:
                 imap.logout()
