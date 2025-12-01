@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # ****** COBOL Support Agent — v10.21 ********
 # ****** Andre Richest                ********
-# ****** Sun Nov 30 2025              ********
+# ****** Mon Dec 01 2025              ********
 
 import os
 import ssl
@@ -11,6 +11,7 @@ import json
 import socket
 import logging
 import threading
+import hashlib
 from typing import Optional, Tuple, List
 
 import imaplib
@@ -20,7 +21,7 @@ from email import message_from_bytes
 from email.utils import parseaddr
 from datetime import datetime, timedelta
 
-import requests  # <-- Mailgun API
+import requests  # <-- Mailgun API + LLM HTTP
 
 from flask import Flask, jsonify, request
 
@@ -55,7 +56,7 @@ FOLDER_PROCESSED = os.getenv("FOLDER_PROCESSED", "Respondidos")
 FOLDER_ESCALATE = os.getenv("FOLDER_ESCALATE", "Escalar")
 EXPUNGE_AFTER_COPY = os.getenv("EXPUNGE_AFTER_COPY", "true").lower() == "true"
 
-# Pasta onde a resposta enviada deve aparecer (Enviados)
+# Pasta onde a resposta enviada deve aparecer (Sent Items)
 IMAP_FOLDER_SENT = os.getenv("IMAP_FOLDER_SENT", "Enviados")
 
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
@@ -88,19 +89,16 @@ MAILGUN_API_KEY = os.getenv("MAILGUN_API_KEY", "")
 MAILGUN_DOMAIN = os.getenv("MAILGUN_DOMAIN", "")
 MAILGUN_API_BASE = os.getenv("MAILGUN_API_BASE", "https://api.mailgun.net/v3")
 
+# --- LLM config (genérico via HTTP) ---
+LLM_API_URL = os.getenv("LLM_API_URL", "")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "")
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "60"))
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
+LLM_BLOCK_SECONDS = int(os.getenv("LLM_BLOCK_SECONDS", "300"))
+LLM_HARD_DISABLE = os.getenv("LLM_HARD_DISABLE", "false").lower() == "true"
 
-# Assinatura / rodapé
-SIGNATURE_NAME = os.getenv("SIGNATURE_NAME", "Equipe Aprenda COBOL — Suporte")
-SIGNATURE_FOOTER = os.getenv(
-    "SIGNATURE_FOOTER",
-    (
-        "Se precisar, responda este e-mail com mais detalhes ou anexe seu arquivo .COB/.CBL.\n"
-        "Horário de atendimento: 9h–18h (ET), seg–sex.\n"
-        "Conheça nossa Formação Completa de Programadores COBOL, com COBOL Avançado,\n"
-        "JCL, Db2 e Bancos de Dados completo em:"
-    ),
-).replace("\\n", "\n")
-SIGNATURE_LINKS = os.getenv("SIGNATURE_LINKS", "https://aprendacobol.com.br/assinatura/")
+_llm_block_until_ts: float = 0.0
 
 # ==========================
 # Prompt do sistema
@@ -130,7 +128,11 @@ SYSTEM_PROMPT = (
     "- Conheça a Formação Completa de Programador COBOL: https://assinatura.aprendacobol.com.br "
 )
 SYSTEM_PROMPT_SHA1 = hashlib.sha1(SYSTEM_PROMPT.encode("utf-8")).hexdigest()
-log.info("SYSTEM_PROMPT_SHA1=%s (primeiros 120 chars): %s", SYSTEM_PROMPT_SHA1[:12], SYSTEM_PROMPT[:120])
+log.info(
+    "SYSTEM_PROMPT_SHA1=%s (primeiros 120 chars): %s",
+    SYSTEM_PROMPT_SHA1[:12],
+    SYSTEM_PROMPT[:120],
+)
 
 # ==========================
 # Helpers LLM
@@ -138,16 +140,201 @@ log.info("SYSTEM_PROMPT_SHA1=%s (primeiros 120 chars): %s", SYSTEM_PROMPT_SHA1[:
 def _llm_is_blocked_now() -> bool:
     return LLM_HARD_DISABLE or (time.time() < _llm_block_until_ts)
 
-def _llm_block(reason: str, seconds: int):
-    global _llm_block_until_ts, _last_llm_error
-    _last_llm_error = f"{reason} (cooldown {seconds}s)"
-    _llm_block_until_ts = time.time() + max(0, seconds)
-    log.warning("LLM bloqueado: %s", _last_llm_error)
-    
-# -------------------------------------------------------------
-# Helpers
-# -------------------------------------------------------------
 
+def _llm_mark_blocked(seconds: int):
+    global _llm_block_until_ts
+    _llm_block_until_ts = time.time() + max(0, seconds)
+
+
+def _parse_llm_json(raw: str) -> dict:
+    """
+    Tenta extrair JSON de um texto retornado pela LLM,
+    mesmo que ela coloque algo antes/depois.
+    """
+    s = raw.strip()
+    start = s.find("{")
+    end = s.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        s = s[start : end + 1]
+    return json.loads(s)
+
+
+def _call_llm(user_prompt: str) -> dict:
+    """
+    Chama o endpoint HTTP da LLM (estilo OpenAI / OpenRouter),
+    usando SYSTEM_PROMPT no role=system e retornando o dict parseado.
+    """
+    if not LLM_API_URL or not LLM_MODEL:
+        raise RuntimeError("LLM_API_URL/LLM_MODEL não configurados")
+
+    headers = {"Content-Type": "application/json"}
+    if LLM_API_KEY:
+        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.2,
+    }
+
+    last_err = None
+    for attempt in range(1, LLM_MAX_RETRIES + 1):
+        try:
+            resp = requests.post(
+                LLM_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=LLM_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            # Tenta formato estilo chat.completions OpenAI/OpenRouter
+            content = None
+            try:
+                content = data["choices"][0]["message"]["content"]
+            except Exception:
+                if "choices" in data and data["choices"]:
+                    ch = data["choices"][0]
+                    if "text" in ch:
+                        content = ch["text"]
+            if not content:
+                raise RuntimeError("Resposta LLM em formato inesperado")
+            return _parse_llm_json(content)
+        except Exception as e:
+            last_err = e
+            log.warning(f"Chamada LLM falhou (tentativa {attempt}/{LLM_MAX_RETRIES}): {e}")
+            time.sleep(1)
+
+    raise RuntimeError(f"LLM indisponível após {LLM_MAX_RETRIES} tentativas: {last_err}")
+
+
+def _extract_email_plaintext(msg) -> str:
+    """
+    Extrai o corpo em texto simples do e-mail, priorizando text/plain.
+    """
+    def decode_payload(part):
+        payload = part.get_payload(decode=True) or b""
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            return payload.decode(charset, errors="replace")
+        except Exception:
+            return payload.decode("utf-8", errors="replace")
+
+    if msg.is_multipart():
+        # Primeiro tenta text/plain sem ser attachment
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            disp = (part.get("Content-Disposition") or "").lower()
+            if ctype == "text/plain" and "attachment" not in disp:
+                return decode_payload(part)
+        # Depois tenta text/html
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            disp = (part.get("Content-Disposition") or "").lower()
+            if ctype == "text/html" and "attachment" not in disp:
+                return decode_payload(part)
+        return ""
+    else:
+        return decode_payload(msg)
+
+
+def _extract_cobol_attachments(msg) -> str:
+    """
+    Retorna string com conteúdo (truncado) de anexos COBOL (.cob, .cbl, .cpy).
+    """
+    texts = []
+    for part in msg.walk():
+        disp = (part.get("Content-Disposition") or "").lower()
+        fname = part.get_filename()
+        if "attachment" in disp and fname:
+            lf = fname.lower()
+            if lf.endswith((".cob", ".cbl", ".cpy")):
+                payload = part.get_payload(decode=True) or b""
+                charset = part.get_content_charset() or "utf-8"
+                try:
+                    content = payload.decode(charset, errors="replace")
+                except Exception:
+                    content = payload.decode("utf-8", errors="replace")
+                if len(content) > 8000:
+                    content = content[:8000]
+                texts.append(f"Arquivo: {fname}\n{content}")
+    return "\n\n".join(texts)
+
+
+def _default_reply_dict(subject: str) -> dict:
+    """
+    Resposta de fallback caso LLM esteja indisponível.
+    """
+    corpo = (
+        "Olá!\n\n"
+        "Recebemos o seu e-mail sobre COBOL. Esta é uma resposta automática de teste, "
+        "pois nosso assistente inteligente não está disponível no momento.\n\n"
+        "Em breve, você receberá uma resposta mais detalhada.\n"
+        "\n"
+        "- Nossa Comunidade no Telegram: https://t.me/aprendacobol\n"
+        "- Conheça a Formação Completa de Programador COBOL: https://assinatura.aprendacobol.com.br"
+    )
+    return {
+        "assunto": subject or "(sem assunto)",
+        "corpo_markdown": corpo,
+        "nivel_confianca": 0.0,
+        "acao": "responder",
+    }
+
+
+def _generate_reply_for_message(msg) -> Optional[dict]:
+    """
+    Gera o dict {assunto, corpo_markdown, nivel_confianca, acao}
+    usando a LLM; se bloqueada e fallback habilitado, usa resposta padrão;
+    se bloqueada e fallback desabilitado, retorna None (vai para Escalar).
+    """
+    subject = msg.get("Subject", "(sem assunto)")
+
+    if _llm_is_blocked_now():
+        log.warning("LLM está bloqueada no momento.")
+        if IMAP_FALLBACK_WHEN_LLM_BLOCKED:
+            return _default_reply_dict(subject)
+        else:
+            return None
+
+    # Se LLM não está configurada, trata como 'hard disable'
+    if not LLM_API_URL or not LLM_MODEL or LLM_HARD_DISABLE:
+        log.info("LLM desativada ou não configurada; usando resposta padrão.")
+        return _default_reply_dict(subject)
+
+    from_addr = parseaddr(msg.get("From", ""))[1]
+    body_txt = _extract_email_plaintext(msg)
+    cobol_txt = _extract_cobol_attachments(msg)
+
+    user_prompt = (
+        f"Remetente: {from_addr}\n"
+        f"Assunto original: {subject}\n\n"
+        f"Corpo do e-mail (texto):\n{body_txt}\n\n"
+    )
+    if cobol_txt:
+        user_prompt += f"Anexos COBOL:\n{cobol_txt}\n\n"
+
+    try:
+        reply = _call_llm(user_prompt)
+        # Garantir chaves básicas
+        for k in ("assunto", "corpo_markdown", "nivel_confianca", "acao"):
+            reply.setdefault(k, "")
+        return reply
+    except Exception as e:
+        log.error("Falha ao obter resposta da LLM; marcando como bloqueada.", exc_info=True)
+        _llm_mark_blocked(LLM_BLOCK_SECONDS)
+        if IMAP_FALLBACK_WHEN_LLM_BLOCKED:
+            return _default_reply_dict(subject)
+        else:
+            return None
+
+
+# -------------------------------------------------------------
+# Helpers gerais
+# -------------------------------------------------------------
 def _resolve_host(host: str) -> List[str]:
     """Resolve hostnames to IPs; opcionalmente prefere IPv4 (só para log)."""
     try:
@@ -189,7 +376,7 @@ def _build_from_header() -> str:
 def _append_to_sent_imap(imap, to_addr: str, subject: str, full_body: str):
     """
     Grava a cópia da resposta na pasta de itens enviados (IMAP_FOLDER_SENT),
-    já como lida (\Seen), para atender o requisito de aparecer em 'Enviados'.
+    já como lida (\Seen), para atender o requisito de aparecer em 'Sent Items'.
     """
     if not IMAP_FOLDER_SENT:
         return
@@ -464,6 +651,11 @@ def _should_skip_message(msg) -> bool:
         log.info(f"Pulando bounce/mail daemon: {from_addr}")
         return True
 
+    # Filtrar rápido notificações Hotmart/noreply aqui também (além do prompt)
+    if "hotmart" in from_addr or "noreply" in from_addr:
+        log.info(f"Pulando notificação automatizada: {from_addr}")
+        return True
+
     # Exemplo de filtro simples por assunto (ajuste se quiser)
     if subj.startswith("re:") and from_addr == to_addr:
         log.info(f"Pulando potencial loop de resposta para {from_addr}")
@@ -472,21 +664,13 @@ def _should_skip_message(msg) -> bool:
     return False
 
 
-def _should_escalate(msg) -> bool:
-    """
-    Placeholder para lógica de escalonamento.
-    Atualmente SEMPRE retorna False. No futuro, integrar com LLM
-    ou regras específicas para decidir se o e-mail é 'passível de escalar'.
-    """
-    return False
-
-
 def _process_single_message(imap, msg_id: bytes):
     """
     Processa UMA mensagem:
     - faz FETCH
     - parseia
-    - envia uma resposta simples via Mailgun (send_test_email)
+    - gera resposta via LLM (ou fallback)
+    - envia resposta
     - grava cópia da resposta em IMAP_FOLDER_SENT
     - marca como lida e move para FOLDER_PROCESSED OU, se escalável,
       copia APENAS para FOLDER_ESCALATE (como não lida) e marca original como lido.
@@ -508,28 +692,57 @@ def _process_single_message(imap, msg_id: bytes):
         if _should_skip_message(msg):
             return
 
-        escalate = _should_escalate(msg)
+        reply = _generate_reply_for_message(msg)
 
-        # Corpo simples de resposta — aqui entra o LLM no futuro
-        body = (
-            "Olá!\n\n"
-            "Recebemos o seu e-mail sobre COBOL. Esta é uma resposta automática de teste "
-            "enviada pelo agente de suporte.\n\n"
-            "Em breve, você receberá uma resposta mais detalhada.\n"
-        )
-        reply_subject = f"Re: {subject}"
-        full_body = _compose_full_text(body)
+        # Se reply=None, significa que LLM está bloqueada e fallback desabilitado:
+        # não responde, apenas manda para Escalar.
+        if reply is None:
+            log.info("Nenhuma resposta automática gerada. Encaminhando e-mail para Escalar.")
+            try:
+                imap.store(msg_id, "+FLAGS", "\\Seen")
+            except Exception as e:
+                log.warning(f"Falha ao marcar \\Seen para ID={msg_id}: {e}")
 
-        # Envia resposta para o remetente original
+            try:
+                if FOLDER_ESCALATE:
+                    imap.copy(msg_id, FOLDER_ESCALATE)
+                    log.info(f"Mensagem ID={msg_id} copiada para {FOLDER_ESCALATE} (escalar por falha LLM)")
+            except Exception as e:
+                log.warning(f"Falha ao copiar mensagem ID={msg_id} para {FOLDER_ESCALATE}: {e}")
+
+            if EXPUNGE_AFTER_COPY:
+                try:
+                    imap.store(msg_id, "+FLAGS", "\\Deleted")
+                    log.info(f"Mensagem ID={msg_id} marcada como \\Deleted (após falha LLM)")
+                except Exception as e:
+                    log.warning(f"Falha ao marcar \\Deleted para ID={msg_id}: {e}")
+            return
+
+        # Normaliza resposta da LLM / fallback
+        llm_subject = reply.get("assunto") or subject or "(sem assunto)"
+        corpo_markdown = reply.get("corpo_markdown") or ""
+        acao = (reply.get("acao") or "responder").lower().strip()
+        nivel_confianca = reply.get("nivel_confianca")
+
+        reply_subject = llm_subject
+        if not reply_subject.lower().startswith("re:"):
+            reply_subject = f"Re: {reply_subject}"
+
+        # Decide se escalável
+        escalate = (acao == "escalar")
+
+        full_body = _compose_full_text(corpo_markdown)
+
+        # Envia resposta para o remetente original (se houver)
         if from_addr:
             send_test_email(
                 to_addr=from_addr,
                 subject=reply_subject,
-                body=body,
+                body=corpo_markdown,
             )
-            log.info(f"Resposta enviada para {from_addr}")
+            log.info(f"Resposta enviada para {from_addr} (acao={acao}, nivel_confianca={nivel_confianca})")
 
-            # Grava cópia na pasta de enviados (Enviados)
+            # Grava cópia na pasta de enviados (Sent Items)
             _append_to_sent_imap(imap, from_addr, reply_subject, full_body)
         else:
             log.warning(f"Mensagem ID={msg_id} sem remetente válido; não foi possível responder")
@@ -544,7 +757,7 @@ def _process_single_message(imap, msg_id: bytes):
             except Exception as e:
                 log.warning(f"Falha ao copiar mensagem ID={msg_id} para {FOLDER_ESCALATE}: {e}")
 
-            # 2) Agora sim marcar original como lida (para não reprocessar)
+            # 2) Agora marcar original como lida (para não reprocessar)
             try:
                 imap.store(msg_id, "+FLAGS", "\\Seen")
             except Exception as e:
@@ -670,6 +883,11 @@ def root():
             "domain": MAILGUN_DOMAIN,
             "api_base": MAILGUN_API_BASE,
             "api_configured": bool(MAILGUN_API_KEY and MAILGUN_DOMAIN),
+        },
+        "llm": {
+            "api_url": bool(LLM_API_URL),
+            "model": LLM_MODEL,
+            "hard_disable": LLM_HARD_DISABLE,
         }
     })
 
@@ -687,7 +905,7 @@ def diag_imap_auth():
         try:
             typ, _ = imap.select(IMAP_FOLDER_INBOX)
             if typ != 'OK':
-                raise RuntimeError(f"SELECT {IMAP_FOLDER_INBOX} falhou: {typ}")
+                raise RuntimeError(f"SELECT IMAP_FOLDER_INBOX} falhou: {typ}")
         finally:
             try:
                 imap.logout()
