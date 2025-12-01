@@ -88,6 +88,62 @@ MAILGUN_API_KEY = os.getenv("MAILGUN_API_KEY", "")
 MAILGUN_DOMAIN = os.getenv("MAILGUN_DOMAIN", "")
 MAILGUN_API_BASE = os.getenv("MAILGUN_API_BASE", "https://api.mailgun.net/v3")
 
+
+# Assinatura / rodapé
+SIGNATURE_NAME = os.getenv("SIGNATURE_NAME", "Equipe Aprenda COBOL — Suporte")
+SIGNATURE_FOOTER = os.getenv(
+    "SIGNATURE_FOOTER",
+    (
+        "Se precisar, responda este e-mail com mais detalhes ou anexe seu arquivo .COB/.CBL.\n"
+        "Horário de atendimento: 9h–18h (ET), seg–sex.\n"
+        "Conheça nossa Formação Completa de Programadores COBOL, com COBOL Avançado,\n"
+        "JCL, Db2 e Bancos de Dados completo em:"
+    ),
+).replace("\\n", "\n")
+SIGNATURE_LINKS = os.getenv("SIGNATURE_LINKS", "https://aprendacobol.com.br/assinatura/")
+
+# ==========================
+# Prompt do sistema
+# ==========================
+SYSTEM_PROMPT = (
+    "Você é um assistente do time de suporte de um curso de COBOL da Aprenda COBOL. "
+    "E-mails da Hotmart ou originados com o remetente 'noreply' não devem ser respondidos, devem ser ignorados por você."
+    "SEMPRE produza um JSON VÁLIDO e nada além disso. "
+    "Formato do JSON (minificado, sem comentários, sem markdown, sem texto extra): "
+    "{\"assunto\": \"...\", \"corpo_markdown\": \"...\", \"nivel_confianca\": 0.0, \"acao\": \"responder|escalar\"} "
+    "Regras: "
+    "1) NUNCA inclua crases ou ``` no output. "
+    "2) NUNCA acrescente explicações fora do JSON. "
+    "3) Sempre use chaves exatamente como no esquema. "
+    "4) PT-BR no corpo. "
+    "5) 'nivel_confianca' entre 0 e 1. "
+    "6) Se pedido estiver claro e respondível, 'acao'='responder' com nivel_confianca>=0.8; "
+    "   se ambíguo/incompleto, 'acao'='escalar' com nivel_confianca<=0.6. "
+    "7) Assunto: defina 'assunto' EXATAMENTE como o assunto original do e-mail (não traduza, não resuma, não invente). "
+    "   Se o original já tiver 'Re:' no início, mantenha como está. OBS: o sistema adicionará 'Re: ' no envio se faltar. "
+    "8) Se houver arquivo anexo .COB/.CBL/.CPY com código COBOL, priorize analisar o código; cite elementos COBOL "
+    "   (DIVISION, SECTION, PIC, níveis, I/O, SQLCA etc.). Identifique erros comuns e sugira correções objetivas. "
+    "9) Não mude o tema da conversa. Responda ao que foi solicitado, de forma educada e objetiva, sempre como parte de um time (nós). "
+    "10) Se faltar informação para compilar/executar, peça os dados mínimos (ex.: amostras de entrada/saída, layout, JCL). "
+    "11) No final do 'corpo_markdown', SEMPRE inclua exatamente estas duas linhas (URLs como texto puro, sem markdown de link): "
+    "- Nossa Comunidade no Telegram: https://t.me/aprendacobol "
+    "- Conheça a Formação Completa de Programador COBOL: https://assinatura.aprendacobol.com.br "
+)
+SYSTEM_PROMPT_SHA1 = hashlib.sha1(SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+log.info("SYSTEM_PROMPT_SHA1=%s (primeiros 120 chars): %s", SYSTEM_PROMPT_SHA1[:12], SYSTEM_PROMPT[:120])
+
+# ==========================
+# Helpers LLM
+# ==========================
+def _llm_is_blocked_now() -> bool:
+    return LLM_HARD_DISABLE or (time.time() < _llm_block_until_ts)
+
+def _llm_block(reason: str, seconds: int):
+    global _llm_block_until_ts, _last_llm_error
+    _last_llm_error = f"{reason} (cooldown {seconds}s)"
+    _llm_block_until_ts = time.time() + max(0, seconds)
+    log.warning("LLM bloqueado: %s", _last_llm_error)
+    
 # -------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------
