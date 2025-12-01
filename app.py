@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# ****** COBOL Support Agent — v10.20 ********
+# ****** COBOL Support Agent — v10.21 ********
 # ****** Andre Richest                ********
-# ****** Mon Dec 01 2025              ********
+# ****** Sun Nov 30 2025              ********
 
 import os
 import ssl
@@ -54,6 +54,9 @@ IMAP_FALLBACK_WHEN_LLM_BLOCKED = os.getenv("IMAP_FALLBACK_WHEN_LLM_BLOCKED", "Fa
 FOLDER_PROCESSED = os.getenv("FOLDER_PROCESSED", "Respondidos")
 FOLDER_ESCALATE = os.getenv("FOLDER_ESCALATE", "Escalar")
 EXPUNGE_AFTER_COPY = os.getenv("EXPUNGE_AFTER_COPY", "true").lower() == "true"
+
+# Pasta onde a resposta enviada deve aparecer (Sent Items)
+IMAP_FOLDER_SENT = os.getenv("IMAP_FOLDER_SENT", "Sent Itens")
 
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
 
@@ -109,6 +112,47 @@ def _ssl_context() -> ssl.SSLContext:
     ctx.check_hostname = True
     ctx.verify_mode = ssl.CERT_REQUIRED
     return ctx
+
+
+def _compose_full_text(body: str) -> str:
+    """
+    Garante que TODAS as saídas tenham a mesma assinatura padrão
+    com nome, footer e links (cursos, etc.).
+    """
+    return body + f"\n\n{SIGNATURE_NAME}\n{SIGNATURE_FOOTER}\n{SIGNATURE_LINKS}"
+
+
+def _build_from_header() -> str:
+    email = SMTP_FROM_EMAIL or SMTP_USER
+    name = (SMTP_FROM_NAME or "").strip()
+    if email and name:
+        return f"{name} <{email}>"
+    return email or ""
+
+
+def _append_to_sent_imap(imap, to_addr: str, subject: str, full_body: str):
+    """
+    Grava a cópia da resposta na pasta de itens enviados (IMAP_FOLDER_SENT),
+    já como lida (\Seen), para atender o requisito de aparecer em 'Sent Items'.
+    """
+    if not IMAP_FOLDER_SENT:
+        return
+    try:
+        msg_out = EmailMessage()
+        from_header = _build_from_header() or IMAP_USER
+        if from_header:
+            msg_out["From"] = from_header
+        msg_out["To"] = to_addr
+        msg_out["Subject"] = subject
+        if SMTP_REPLY_TO:
+            msg_out["Reply-To"] = SMTP_REPLY_TO
+        msg_out.set_content(full_body)
+
+        raw_out = msg_out.as_bytes()
+        imap.append(IMAP_FOLDER_SENT, "\\Seen", None, raw_out)
+        log.info(f"Resposta gravada em pasta de enviados: {IMAP_FOLDER_SENT}")
+    except Exception as e:
+        log.warning(f"Falha ao gravar resposta em {IMAP_FOLDER_SENT}: {e}")
 
 
 # -------------------------------------------------------------
@@ -243,20 +287,12 @@ def smtp_connect_with_fallback() -> smtplib.SMTP:
 # Mailgun API send
 # -------------------------------------------------------------
 
-def _build_from_header() -> str:
-    email = SMTP_FROM_EMAIL or SMTP_USER
-    name = (SMTP_FROM_NAME or "").strip()
-    if email and name:
-        return f"{name} <{email}>"
-    return email or ""
-
-
 def send_via_mailgun_api(to_addr: str, subject: str, body: str) -> str:
     if not MAILGUN_API_KEY or not MAILGUN_DOMAIN:
         raise RuntimeError("Mailgun API não configurada (MAILGUN_API_KEY/MAILGUN_DOMAIN)")
 
     from_header = _build_from_header()
-    text_body = body + f"\n\n{SIGNATURE_NAME}\n{SIGNATURE_FOOTER}\n{SIGNATURE_LINKS}"
+    text_body = _compose_full_text(body)
 
     url = f"{MAILGUN_API_BASE.rstrip('/')}/{MAILGUN_DOMAIN}/messages"
     data = {
@@ -305,9 +341,7 @@ def send_test_email(to_addr: str, subject: str, body: str) -> str:
 
         msg["To"] = to_addr
         msg["Subject"] = subject
-        msg.set_content(
-            body + f"\n\n{SIGNATURE_NAME}\n{SIGNATURE_FOOTER}\n{SIGNATURE_LINKS}"
-        )
+        msg.set_content(_compose_full_text(body))
         s.send_message(msg)
         return "ok"
     finally:
@@ -382,13 +416,24 @@ def _should_skip_message(msg) -> bool:
     return False
 
 
+def _should_escalate(msg) -> bool:
+    """
+    Placeholder para lógica de escalonamento.
+    Atualmente SEMPRE retorna False. No futuro, integrar com LLM
+    ou regras específicas para decidir se o e-mail é 'passível de escalar'.
+    """
+    return False
+
+
 def _process_single_message(imap, msg_id: bytes):
     """
     Processa UMA mensagem:
     - faz FETCH
     - parseia
     - envia uma resposta simples via Mailgun (send_test_email)
-    - marca como lida e move para FOLDER_PROCESSED
+    - grava cópia da resposta em IMAP_FOLDER_SENT
+    - marca como lida e move para FOLDER_PROCESSED OU, se escalável,
+      copia APENAS para FOLDER_ESCALATE (como não lida) e marca original como lido.
     """
     try:
         typ, data = imap.fetch(msg_id, "(RFC822)")
@@ -407,6 +452,8 @@ def _process_single_message(imap, msg_id: bytes):
         if _should_skip_message(msg):
             return
 
+        escalate = _should_escalate(msg)
+
         # Corpo simples de resposta — aqui entra o LLM no futuro
         body = (
             "Olá!\n\n"
@@ -414,39 +461,66 @@ def _process_single_message(imap, msg_id: bytes):
             "enviada pelo agente de suporte.\n\n"
             "Em breve, você receberá uma resposta mais detalhada.\n"
         )
+        reply_subject = f"Re: {subject}"
+        full_body = _compose_full_text(body)
 
         # Envia resposta para o remetente original
         if from_addr:
             send_test_email(
                 to_addr=from_addr,
-                subject=f"Re: {subject}",
+                subject=reply_subject,
                 body=body,
             )
             log.info(f"Resposta enviada para {from_addr}")
+
+            # Grava cópia na pasta de enviados (Sent Items)
+            _append_to_sent_imap(imap, from_addr, reply_subject, full_body)
         else:
             log.warning(f"Mensagem ID={msg_id} sem remetente válido; não foi possível responder")
 
-        # Marca como lida
-        try:
-            imap.store(msg_id, "+FLAGS", "\\Seen")
-        except Exception as e:
-            log.warning(f"Falha ao marcar \\Seen para ID={msg_id}: {e}")
-
-        # Copia para pasta de processados
-        try:
-            if FOLDER_PROCESSED:
-                imap.copy(msg_id, FOLDER_PROCESSED)
-                log.info(f"Mensagem ID={msg_id} copiada para {FOLDER_PROCESSED}")
-        except Exception as e:
-            log.warning(f"Falha ao copiar mensagem ID={msg_id} para {FOLDER_PROCESSED}: {e}")
-
-        # Se quiser realmente mover (tirar da INBOX), marcar como deletada
-        if EXPUNGE_AFTER_COPY:
+        # MOVIMENTAÇÃO EM PASTAS
+        if escalate:
+            # 1) Copiar APENAS para FOLDER_ESCALATE, mantendo como 'não lido' lá.
             try:
-                imap.store(msg_id, "+FLAGS", "\\Deleted")
-                log.info(f"Mensagem ID={msg_id} marcada como \\Deleted")
+                if FOLDER_ESCALATE:
+                    imap.copy(msg_id, FOLDER_ESCALATE)
+                    log.info(f"Mensagem ID={msg_id} copiada para {FOLDER_ESCALATE} (escalar)")
             except Exception as e:
-                log.warning(f"Falha ao marcar \\Deleted para ID={msg_id}: {e}")
+                log.warning(f"Falha ao copiar mensagem ID={msg_id} para {FOLDER_ESCALATE}: {e}")
+
+            # 2) Agora sim marcar original como lida (para não reprocessar)
+            try:
+                imap.store(msg_id, "+FLAGS", "\\Seen")
+            except Exception as e:
+                log.warning(f"Falha ao marcar \\Seen para ID={msg_id}: {e}")
+
+            # 3) Opcionalmente marcar para remoção da INBOX
+            if EXPUNGE_AFTER_COPY:
+                try:
+                    imap.store(msg_id, "+FLAGS", "\\Deleted")
+                    log.info(f"Mensagem ID={msg_id} marcada como \\Deleted (após escalar)")
+                except Exception as e:
+                    log.warning(f"Falha ao marcar \\Deleted para ID={msg_id}: {e}")
+        else:
+            # Fluxo normal: marcar como lida, copiar para Respondidos e opcionalmente remover da INBOX
+            try:
+                imap.store(msg_id, "+FLAGS", "\\Seen")
+            except Exception as e:
+                log.warning(f"Falha ao marcar \\Seen para ID={msg_id}: {e}")
+
+            try:
+                if FOLDER_PROCESSED:
+                    imap.copy(msg_id, FOLDER_PROCESSED)
+                    log.info(f"Mensagem ID={msg_id} copiada para {FOLDER_PROCESSED}")
+            except Exception as e:
+                log.warning(f"Falha ao copiar mensagem ID={msg_id} para {FOLDER_PROCESSED}: {e}")
+
+            if EXPUNGE_AFTER_COPY:
+                try:
+                    imap.store(msg_id, "+FLAGS", "\\Deleted")
+                    log.info(f"Mensagem ID={msg_id} marcada como \\Deleted")
+                except Exception as e:
+                    log.warning(f"Falha ao marcar \\Deleted para ID={msg_id}: {e}")
 
     except Exception as e:
         log.error(f"Erro ao processar mensagem ID={msg_id}: {e}", exc_info=True)
