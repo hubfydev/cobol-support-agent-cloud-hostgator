@@ -55,8 +55,8 @@ FOLDER_PROCESSED = os.getenv("FOLDER_PROCESSED", "Respondidos")
 FOLDER_ESCALATE = os.getenv("FOLDER_ESCALATE", "Escalar")
 EXPUNGE_AFTER_COPY = os.getenv("EXPUNGE_AFTER_COPY", "true").lower() == "true"
 
-# Pasta onde a resposta enviada deve aparecer (Sent Items)
-IMAP_FOLDER_SENT = os.getenv("IMAP_FOLDER_SENT", "Sent Itens")
+# Pasta onde a resposta enviada deve aparecer (Enviados)
+IMAP_FOLDER_SENT = os.getenv("IMAP_FOLDER_SENT", "Enviados")
 
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
 
@@ -133,7 +133,7 @@ def _build_from_header() -> str:
 def _append_to_sent_imap(imap, to_addr: str, subject: str, full_body: str):
     """
     Grava a cópia da resposta na pasta de itens enviados (IMAP_FOLDER_SENT),
-    já como lida (\Seen), para atender o requisito de aparecer em 'Sent Items'.
+    já como lida (\Seen), para atender o requisito de aparecer em 'Enviados'.
     """
     if not IMAP_FOLDER_SENT:
         return
@@ -473,7 +473,7 @@ def _process_single_message(imap, msg_id: bytes):
             )
             log.info(f"Resposta enviada para {from_addr}")
 
-            # Grava cópia na pasta de enviados (Sent Items)
+            # Grava cópia na pasta de enviados (Enviados)
             _append_to_sent_imap(imap, from_addr, reply_subject, full_body)
         else:
             log.warning(f"Mensagem ID={msg_id} sem remetente válido; não foi possível responder")
