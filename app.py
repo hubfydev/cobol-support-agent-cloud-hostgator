@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# ****** COBOL Support Agent — v10.19 ********
+# ****** COBOL Support Agent — v10.20 ********
 # ****** Andre Richest                ********
-# ****** Sun Nov 30 2025              ********
+# ****** Mon Dec 01 2025              ********
 
 import os
 import ssl
@@ -16,6 +16,9 @@ from typing import Optional, Tuple, List
 import imaplib
 import smtplib
 from email.message import EmailMessage
+from email import message_from_bytes
+from email.utils import parseaddr
+from datetime import datetime, timedelta
 
 import requests  # <-- Mailgun API
 
@@ -315,7 +318,184 @@ def send_test_email(to_addr: str, subject: str, body: str) -> str:
 
 
 # -------------------------------------------------------------
-# Watcher (checks auth + SELECT INBOX)
+# IMAP: busca e processamento básico de mensagens
+# -------------------------------------------------------------
+
+def _search_messages(imap) -> List[bytes]:
+    """
+    Retorna uma lista de IDs (em bytes) de mensagens candidatas
+    para processamento, respeitando IMAP_STRICT_UNSEEN_ONLY e IMAP_SINCE_DAYS.
+    """
+    criteria: List[str] = []
+
+    # Base: UNSEEN ou ALL
+    if IMAP_STRICT_UNSEEN_ONLY:
+        criteria.append("UNSEEN")
+    else:
+        criteria.append("ALL")
+
+    # SINCE (opcional)
+    if IMAP_SINCE_DAYS > 0:
+        since_date = (datetime.utcnow() - timedelta(days=IMAP_SINCE_DAYS)).strftime("%d-%b-%Y")
+        criteria.extend(["SINCE", since_date])
+
+    try:
+        typ, data = imap.search(None, *criteria)
+        if typ != "OK" or not data or not data[0]:
+            return []
+        ids = data[0].split()
+        return ids
+    except Exception as e:
+        log.error(f"IMAP SEARCH falhou: {e}", exc_info=True)
+        return []
+
+
+def _should_skip_message(msg) -> bool:
+    """
+    Regras simples para evitar loop de auto-resposta, etc.
+    """
+    from_addr = parseaddr(msg.get("From", ""))[1].lower()
+    to_addr = parseaddr(msg.get("To", ""))[1].lower()
+
+    support_addrs = set([
+        (SMTP_USER or "").lower(),
+        (SMTP_FROM_EMAIL or "").lower(),
+        IMAP_USER.lower(),
+    ])
+
+    # Não responder e-mails que nós mesmos enviamos
+    if from_addr in support_addrs:
+        log.info(f"Pulando mensagem de {from_addr} (provavelmente nós mesmos)")
+        return True
+
+    # Evitar auto-resposta para notificações típicas
+    subj = (msg.get("Subject", "") or "").lower()
+    if "mailer-daemon" in from_addr or "postmaster@" in from_addr:
+        log.info(f"Pulando bounce/mail daemon: {from_addr}")
+        return True
+
+    # Exemplo de filtro simples por assunto (ajuste se quiser)
+    if subj.startswith("re:") and from_addr == to_addr:
+        log.info(f"Pulando potencial loop de resposta para {from_addr}")
+        return True
+
+    return False
+
+
+def _process_single_message(imap, msg_id: bytes):
+    """
+    Processa UMA mensagem:
+    - faz FETCH
+    - parseia
+    - envia uma resposta simples via Mailgun (send_test_email)
+    - marca como lida e move para FOLDER_PROCESSED
+    """
+    try:
+        typ, data = imap.fetch(msg_id, "(RFC822)")
+        if typ != "OK" or not data or not data[0]:
+            log.warning(f"FETCH falhou para ID {msg_id}")
+            return
+
+        raw = data[0][1]
+        msg = message_from_bytes(raw)
+
+        from_addr = parseaddr(msg.get("From", ""))[1]
+        subject = msg.get("Subject", "(sem assunto)")
+
+        log.info(f"Processando mensagem ID={msg_id} de={from_addr} assunto={subject!r}")
+
+        if _should_skip_message(msg):
+            return
+
+        # Corpo simples de resposta — aqui entra o LLM no futuro
+        body = (
+            "Olá!\n\n"
+            "Recebemos o seu e-mail sobre COBOL. Esta é uma resposta automática de teste "
+            "enviada pelo agente de suporte.\n\n"
+            "Em breve, você receberá uma resposta mais detalhada.\n"
+        )
+
+        # Envia resposta para o remetente original
+        if from_addr:
+            send_test_email(
+                to_addr=from_addr,
+                subject=f"Re: {subject}",
+                body=body,
+            )
+            log.info(f"Resposta enviada para {from_addr}")
+        else:
+            log.warning(f"Mensagem ID={msg_id} sem remetente válido; não foi possível responder")
+
+        # Marca como lida
+        try:
+            imap.store(msg_id, "+FLAGS", "\\Seen")
+        except Exception as e:
+            log.warning(f"Falha ao marcar \\Seen para ID={msg_id}: {e}")
+
+        # Copia para pasta de processados
+        try:
+            if FOLDER_PROCESSED:
+                imap.copy(msg_id, FOLDER_PROCESSED)
+                log.info(f"Mensagem ID={msg_id} copiada para {FOLDER_PROCESSED}")
+        except Exception as e:
+            log.warning(f"Falha ao copiar mensagem ID={msg_id} para {FOLDER_PROCESSED}: {e}")
+
+        # Se quiser realmente mover (tirar da INBOX), marcar como deletada
+        if EXPUNGE_AFTER_COPY:
+            try:
+                imap.store(msg_id, "+FLAGS", "\\Deleted")
+                log.info(f"Mensagem ID={msg_id} marcada como \\Deleted")
+            except Exception as e:
+                log.warning(f"Falha ao marcar \\Deleted para ID={msg_id}: {e}")
+
+    except Exception as e:
+        log.error(f"Erro ao processar mensagem ID={msg_id}: {e}", exc_info=True)
+
+
+def process_inbox_once():
+    """
+    Abre conexão IMAP, seleciona INBOX, busca mensagens candidatas e processa.
+    É chamado em loop pelo watcher.
+    """
+    try:
+        log.info(
+            f"IMAP tentando login como {IMAP_USER[:2]}***@ "
+            f"em {IMAP_HOST}:{IMAP_PORT} (mode={IMAP_TLS_MODE})"
+        )
+        imap = imap_connect(IMAP_HOST, IMAP_PORT, IMAP_USER, IMAP_PASS, IMAP_TLS_MODE)
+        try:
+            typ, _ = imap.select(IMAP_FOLDER_INBOX)
+            if typ != "OK":
+                raise RuntimeError(f"SELECT {IMAP_FOLDER_INBOX} falhou: {typ}")
+            log.info("IMAP INBOX selecionada, iniciando busca de mensagens")
+
+            ids = _search_messages(imap)
+            if not ids:
+                log.info("Nenhuma mensagem nova para processar")
+            else:
+                log.info(f"Encontradas {len(ids)} mensagens para processar: {ids}")
+                for msg_id in ids:
+                    _process_single_message(imap, msg_id)
+
+            # Se deletamos algo, dá um expunge
+            if EXPUNGE_AFTER_COPY:
+                try:
+                    imap.expunge()
+                except Exception as e:
+                    log.warning(f"EXPUNGE falhou: {e}")
+        finally:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+    except ImapAuthError as e:
+        log.error(f"IMAP AUTH falhou: {e}")
+    except Exception as e:
+        log.error("process_inbox_once falhou", exc_info=e)
+
+
+# -------------------------------------------------------------
+# Watcher (loop de processamento IMAP)
 # -------------------------------------------------------------
 
 def watch_imap_loop():
@@ -326,26 +506,7 @@ def watch_imap_loop():
         f"IMAP_FALLBACK_WHEN_LLM_BLOCKED={IMAP_FALLBACK_WHEN_LLM_BLOCKED}"
     )
     while True:
-        try:
-            log.info(
-                f"IMAP tentando login como {IMAP_USER[:2]}***@ "
-                f"em {IMAP_HOST}:{IMAP_PORT} (mode={IMAP_TLS_MODE})"
-            )
-            imap = imap_connect(IMAP_HOST, IMAP_PORT, IMAP_USER, IMAP_PASS, IMAP_TLS_MODE)
-            try:
-                typ, _ = imap.select(IMAP_FOLDER_INBOX)
-                if typ != 'OK':
-                    raise RuntimeError(f"SELECT {IMAP_FOLDER_INBOX} falhou: {typ}")
-                log.info(f"IMAP autenticado e INBOX aberto — aguardando {CHECK_INTERVAL_SECONDS}s")
-            finally:
-                try:
-                    imap.logout()
-                except Exception:
-                    pass
-        except ImapAuthError as e:
-            log.error(f"IMAP AUTH falhou: {e}")
-        except Exception as e:
-            log.error("Loop IMAP falhou", exc_info=e)
+        process_inbox_once()
         time.sleep(CHECK_INTERVAL_SECONDS)
 
 
