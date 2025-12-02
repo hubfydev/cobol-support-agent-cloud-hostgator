@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# ****** COBOL Support Agent — v10.21 ********
+# ****** COBOL Support Agent — v10.22 ********
 # ****** Andre Richest                ********
 # ****** Mon Dec 01 2025              ********
 
@@ -613,7 +613,7 @@ def _search_messages(imap) -> List[bytes]:
 
     # SINCE (opcional)
     if IMAP_SINCE_DAYS > 0:
-        since_date = (datetime.utcnow() - timedelta(days=IMAP_SINCE_DAYS)).strftime("%d-%b-%Y")
+        since_date = (datetime.utcnow() - timedelta(IMAP_SINCE_DAYS)).strftime("%d-%b-%Y")
         criteria.extend(["SINCE", since_date])
 
     try:
@@ -698,11 +698,7 @@ def _process_single_message(imap, msg_id: bytes):
         # não responde, apenas manda para Escalar.
         if reply is None:
             log.info("Nenhuma resposta automática gerada. Encaminhando e-mail para Escalar.")
-            try:
-                imap.store(msg_id, "+FLAGS", "\\Seen")
-            except Exception as e:
-                log.warning(f"Falha ao marcar \\Seen para ID={msg_id}: {e}")
-
+            # 1) Copiar para FOLDER_ESCALATE mantendo como não lido lá
             try:
                 if FOLDER_ESCALATE:
                     imap.copy(msg_id, FOLDER_ESCALATE)
@@ -710,6 +706,13 @@ def _process_single_message(imap, msg_id: bytes):
             except Exception as e:
                 log.warning(f"Falha ao copiar mensagem ID={msg_id} para {FOLDER_ESCALATE}: {e}")
 
+            # 2) Marcar original como lida na INBOX
+            try:
+                imap.store(msg_id, "+FLAGS", "\\Seen")
+            except Exception as e:
+                log.warning(f"Falha ao marcar \\Seen para ID={msg_id}: {e}")
+
+            # 3) Opcionalmente remover da INBOX
             if EXPUNGE_AFTER_COPY:
                 try:
                     imap.store(msg_id, "+FLAGS", "\\Deleted")
@@ -905,7 +908,7 @@ def diag_imap_auth():
         try:
             typ, _ = imap.select(IMAP_FOLDER_INBOX)
             if typ != 'OK':
-                                raise RuntimeError(f"SELECT {IMAP_FOLDER_INBOX} falhou: {typ}")
+                raise RuntimeError(f"SELECT {IMAP_FOLDER_INBOX} falhou: {typ}")
         finally:
             try:
                 imap.logout()
