@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# ****** COBOL Support Agent — v10.24 ********
+# ****** COBOL Support Agent — v10.25 ********
 # ****** Andre Richest                ********
 # ****** Tue Dec 02 2025              ********
 
@@ -84,33 +84,29 @@ SMTP_REPLY_TO = os.getenv("SMTP_REPLY_TO", SMTP_FROM_EMAIL)
 
 APP_TITLE = os.getenv("APP_TITLE", "COBOL Support Agent")
 
-# --- LLM backend / OpenRouter bridge ---
-LLM_BACKEND = os.getenv("LLM_BACKEND", "").lower()
+# --- Mailgun API ---
+MAILGUN_API_KEY = os.getenv("MAILGUN_API_KEY", "")
+MAILGUN_DOMAIN = os.getenv("MAILGUN_DOMAIN", "")
+MAILGUN_API_BASE = os.getenv("MAILGUN_API_BASE", "https://api.mailgun.net/v3")
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "")
-OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", APP_PUBLIC_URL)
-OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", APP_TITLE)
-
-# --- LLM config (genérico via HTTP) ---
-LLM_API_URL = os.getenv("LLM_API_URL", "")
-if not LLM_API_URL and LLM_BACKEND == "openrouter":
-    # Endpoint padrão da OpenRouter
-    LLM_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-LLM_API_KEY = os.getenv("LLM_API_KEY") or OPENROUTER_API_KEY
-LLM_MODEL = os.getenv("LLM_MODEL") or OPENROUTER_MODEL
+# --- LLM config (genérico via HTTP / OpenRouter) ---
+# Mapeia automaticamente variáveis OPENROUTER_* se LLM_* não forem definidas
+LLM_API_URL = (
+    os.getenv("LLM_API_URL")
+    or "https://openrouter.ai/api/v1/chat/completions"
+)
+LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL") or os.getenv("OPENROUTER_MODEL", "")
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "60"))
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
 LLM_BLOCK_SECONDS = int(os.getenv("LLM_BLOCK_SECONDS", "300"))
 LLM_HARD_DISABLE = os.getenv("LLM_HARD_DISABLE", "false").lower() == "true"
 
-_llm_block_until_ts: float = 0.0
+# Headers extras para OpenRouter (se aplicável)
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", APP_PUBLIC_URL)
+OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", APP_TITLE)
 
-# --- Mailgun API ---
-MAILGUN_API_KEY = os.getenv("MAILGUN_API_KEY", "")
-MAILGUN_DOMAIN = os.getenv("MAILGUN_DOMAIN", "")
-MAILGUN_API_BASE = os.getenv("MAILGUN_API_BASE", "https://api.mailgun.net/v3")
+_llm_block_until_ts: float = 0.0
 
 # ==========================
 # Prompt do sistema
@@ -181,15 +177,15 @@ def _call_llm(user_prompt: str) -> dict:
 
     headers = {"Content-Type": "application/json"}
 
-    if LLM_BACKEND == "openrouter":
-        if not LLM_API_KEY:
-            raise RuntimeError("OPENROUTER_API_KEY / LLM_API_KEY não configurados")
+    if LLM_API_KEY:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
-        headers["HTTP-Referer"] = OPENROUTER_SITE_URL or APP_PUBLIC_URL
-        headers["X-Title"] = OPENROUTER_APP_NAME or APP_TITLE
-    else:
-        if LLM_API_KEY:
-            headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+
+    # Headers específicos exigidos pela OpenRouter
+    if "openrouter.ai" in LLM_API_URL:
+        if OPENROUTER_SITE_URL:
+            headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+        if OPENROUTER_APP_NAME:
+            headers["X-Title"] = OPENROUTER_APP_NAME
 
     payload = {
         "model": LLM_MODEL,
@@ -203,13 +199,24 @@ def _call_llm(user_prompt: str) -> dict:
     last_err = None
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         try:
+            log.info(f"Chamando LLM em {LLM_API_URL} (tentativa {attempt}/{LLM_MAX_RETRIES}, model={LLM_MODEL})")
             resp = requests.post(
                 LLM_API_URL,
                 headers=headers,
                 json=payload,
                 timeout=LLM_TIMEOUT,
             )
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                # Log detalhado para debug (inclui início do corpo da resposta)
+                try:
+                    snippet = resp.text[:500]
+                except Exception:
+                    snippet = "<não foi possível decodificar corpo>"
+                log.warning(
+                    f"LLM HTTP {resp.status_code} em {LLM_API_URL} — corpo parcial: {snippet}"
+                )
+                resp.raise_for_status()
+
             data = resp.json()
             # Tenta formato estilo chat.completions OpenAI/OpenRouter
             content = None
@@ -321,7 +328,7 @@ def _generate_reply_for_message(msg) -> Optional[dict]:
             return None
 
     # Se LLM não está configurada, trata como 'hard disable'
-    if (not LLM_API_URL or not LLM_MODEL) or LLM_HARD_DISABLE:
+    if (not LLM_API_URL or not LLM_MODEL or not LLM_API_KEY) or LLM_HARD_DISABLE:
         log.info("LLM desativada ou não configurada; usando resposta padrão.")
         return _default_reply_dict(subject)
 
@@ -393,40 +400,10 @@ def _build_from_header() -> str:
     return email or ""
 
 
-def _copy_to_folder_with_fallback(imap, msg_id: bytes, folder: str, label: str) -> bool:
-    """
-    Tenta copiar a mensagem para a pasta indicada, tentando variações:
-    - folder
-    - INBOX.folder
-    - INBOX/folder
-
-    Retorna True se algum COPY retornar OK, False caso contrário.
-    """
-    if not folder:
-        return False
-
-    candidates = [folder]
-    if not folder.upper().startswith("INBOX"):
-        candidates.append(f"INBOX.{folder}")
-        candidates.append(f"INBOX/{folder}")
-
-    for f in candidates:
-        try:
-            typ, data = imap.copy(msg_id, f)
-            if typ == "OK":
-                log.info(f"Mensagem ID={msg_id} copiada para {f} ({label})")
-                return True
-            else:
-                log.warning(f"Falha ao copiar mensagem ID={msg_id} para {f} ({label}): typ={typ}, data={data}")
-        except Exception as e:
-            log.warning(f"Erro ao copiar mensagem ID={msg_id} para {f} ({label}): {e}")
-    return False
-
-
 def _append_to_sent_imap(imap, to_addr: str, subject: str, full_body: str):
     """
     Grava a cópia da resposta na pasta de itens enviados (IMAP_FOLDER_SENT),
-    já como lida (\Seen), com fallback para INBOX.<pasta>.
+    já como lida (\\Seen), para atender o requisito de aparecer em 'Sent Items'.
     """
     if not IMAP_FOLDER_SENT:
         return
@@ -442,21 +419,51 @@ def _append_to_sent_imap(imap, to_addr: str, subject: str, full_body: str):
         msg_out.set_content(full_body)
 
         raw_out = msg_out.as_bytes()
-
-        candidates = [IMAP_FOLDER_SENT]
-        if not IMAP_FOLDER_SENT.upper().startswith("INBOX"):
-            candidates.append(f"INBOX.{IMAP_FOLDER_SENT}")
-            candidates.append(f"INBOX/{IMAP_FOLDER_SENT}")
-
-        for f in candidates:
-            try:
-                imap.append(f, "\\Seen", None, raw_out)
-                log.info(f"Resposta gravada em pasta de enviados: {f}")
-                return
-            except Exception as e:
-                log.warning(f"Falha ao gravar resposta em {f}: {e}")
+        imap.append(IMAP_FOLDER_SENT, "\\Seen", None, raw_out)
+        log.info(f"Resposta gravada em pasta de enviados: {IMAP_FOLDER_SENT}")
     except Exception as e:
-        log.warning(f"Falha geral ao gravar resposta em {IMAP_FOLDER_SENT}: {e}")
+        log.warning(f"Falha ao gravar resposta em {IMAP_FOLDER_SENT}: {e}")
+
+
+def _copy_with_namespace_fallback(imap, msg_id: bytes, folder: str, context: str):
+    """
+    Tenta copiar para 'folder'. Se o servidor reclamar de namespace inexistente,
+    tenta novamente com 'INBOX.' como prefixo (ex.: INBOX.Escalar).
+    """
+    if not folder:
+        return
+
+    # Tentativa direta
+    try:
+        typ, data = imap.copy(msg_id, folder)
+        if typ == "OK":
+            log.info(f"Mensagem ID={msg_id} copiada para {folder} ({context})")
+            return
+        else:
+            log.warning(
+                f"Falha ao copiar mensagem ID={msg_id} para {folder} ({context}): "
+                f"typ={typ}, data={data}"
+            )
+    except Exception as e:
+        log.warning(
+            f"Erro ao copiar mensagem ID={msg_id} para {folder} ({context}): {e}"
+        )
+
+    # Fallback com namespace INBOX.
+    fallback_folder = f"INBOX.{folder}"
+    try:
+        typ, data = imap.copy(msg_id, fallback_folder)
+        if typ == "OK":
+            log.info(f"Mensagem ID={msg_id} copiada para {fallback_folder} ({context})")
+        else:
+            log.warning(
+                f"Falha ao copiar mensagem ID={msg_id} para {fallback_folder} ({context}): "
+                f"typ={typ}, data={data}"
+            )
+    except Exception as e:
+        log.warning(
+            f"Erro ao copiar mensagem ID={msg_id} para {fallback_folder} ({context}): {e}"
+        )
 
 
 # -------------------------------------------------------------
@@ -674,7 +681,7 @@ def _search_messages(imap) -> List[bytes]:
 
     # SINCE (opcional)
     if IMAP_SINCE_DAYS > 0:
-        since_date = (datetime.utcnow() - timedelta(days=IMAP_SINCE_DAYS)).strftime("%d-%b-%Y")
+        since_date = (datetime.utcnow() - timedelta(IMAP_SINCE_DAYS)).strftime("%d-%b-%Y")
         criteria.extend(["SINCE", since_date])
 
     try:
@@ -731,10 +738,12 @@ def _process_single_message(imap, msg_id: bytes):
     - faz FETCH
     - parseia
     - gera resposta via LLM (ou fallback)
-    - envia resposta
-    - grava cópia da resposta em IMAP_FOLDER_SENT
-    - marca como lida e move para FOLDER_PROCESSED OU, se escalável,
-      copia APENAS para FOLDER_ESCALATE (como não lida) e marca original como lido.
+    - envia resposta (sempre que houver corpo e remetente, mesmo com acao='escalar')
+    - grava cópia da resposta em IMAP_FOLDER_SENT (se houver resposta)
+    - se escalável: copia APENAS para FOLDER_ESCALATE (como não lido lá),
+      marca original como lida e opcionalmente remove da INBOX.
+    - se não escalável: marca como lida, copia para FOLDER_PROCESSED e
+      opcionalmente remove da INBOX.
     """
     try:
         typ, data = imap.fetch(msg_id, "(RFC822)")
@@ -759,18 +768,15 @@ def _process_single_message(imap, msg_id: bytes):
         # não responde, apenas manda para Escalar.
         if reply is None:
             log.info("Nenhuma resposta automática gerada. Encaminhando e-mail para Escalar.")
-
-            # Copiar para pasta de Escalar (tentando variações de namespace)
-            copied = _copy_to_folder_with_fallback(imap, msg_id, FOLDER_ESCALATE, "escalar por falha LLM")
-
-            # Marcar original como lida (para não reprocessar)
             try:
                 imap.store(msg_id, "+FLAGS", "\\Seen")
             except Exception as e:
                 log.warning(f"Falha ao marcar \\Seen para ID={msg_id}: {e}")
 
-            # Só marcar como deletada se conseguimos copiar para Escalar
-            if EXPUNGE_AFTER_COPY and copied:
+            if FOLDER_ESCALATE:
+                _copy_with_namespace_fallback(imap, msg_id, FOLDER_ESCALATE, "escalar por falha LLM")
+
+            if EXPUNGE_AFTER_COPY:
                 try:
                     imap.store(msg_id, "+FLAGS", "\\Deleted")
                     log.info(f"Mensagem ID={msg_id} marcada como \\Deleted (após falha LLM)")
@@ -793,24 +799,32 @@ def _process_single_message(imap, msg_id: bytes):
 
         full_body = _compose_full_text(corpo_markdown)
 
-        # Envia resposta para o remetente original (se houver)
-        if from_addr:
+        # Envia resposta para o remetente original (SEMPRE que houver corpo e remetente),
+        # independentemente de 'acao' ser 'responder' ou 'escalar'
+        if from_addr and corpo_markdown.strip():
             send_test_email(
                 to_addr=from_addr,
                 subject=reply_subject,
                 body=corpo_markdown,
             )
-            log.info(f"Resposta enviada para {from_addr} (acao={acao}, nivel_confianca={nivel_confianca})")
+            log.info(
+                f"Resposta enviada para {from_addr} (acao={acao}, nivel_confianca={nivel_confianca})"
+            )
 
             # Grava cópia na pasta de enviados (Sent Items)
             _append_to_sent_imap(imap, from_addr, reply_subject, full_body)
-        else:
+        elif not from_addr:
             log.warning(f"Mensagem ID={msg_id} sem remetente válido; não foi possível responder")
+        else:
+            log.info(
+                f"Mensagem ID={msg_id} com resposta vazia; nada enviado, mas fluxo de pastas continuará (acao={acao})."
+            )
 
         # MOVIMENTAÇÃO EM PASTAS
         if escalate:
             # 1) Copiar APENAS para FOLDER_ESCALATE, mantendo como 'não lido' lá.
-            copied = _copy_to_folder_with_fallback(imap, msg_id, FOLDER_ESCALATE, "escalar")
+            if FOLDER_ESCALATE:
+                _copy_with_namespace_fallback(imap, msg_id, FOLDER_ESCALATE, "escalar")
 
             # 2) Agora marcar original como lida (para não reprocessar)
             try:
@@ -818,8 +832,8 @@ def _process_single_message(imap, msg_id: bytes):
             except Exception as e:
                 log.warning(f"Falha ao marcar \\Seen para ID={msg_id}: {e}")
 
-            # 3) Opcionalmente marcar para remoção da INBOX (apenas se copiou)
-            if EXPUNGE_AFTER_COPY and copied:
+            # 3) Opcionalmente marcar para remoção da INBOX
+            if EXPUNGE_AFTER_COPY:
                 try:
                     imap.store(msg_id, "+FLAGS", "\\Deleted")
                     log.info(f"Mensagem ID={msg_id} marcada como \\Deleted (após escalar)")
@@ -832,9 +846,10 @@ def _process_single_message(imap, msg_id: bytes):
             except Exception as e:
                 log.warning(f"Falha ao marcar \\Seen para ID={msg_id}: {e}")
 
-            copied = _copy_to_folder_with_fallback(imap, msg_id, FOLDER_PROCESSED, "respondidos")
+            if FOLDER_PROCESSED:
+                _copy_with_namespace_fallback(imap, msg_id, FOLDER_PROCESSED, "processado")
 
-            if EXPUNGE_AFTER_COPY and copied:
+            if EXPUNGE_AFTER_COPY:
                 try:
                     imap.store(msg_id, "+FLAGS", "\\Deleted")
                     log.info(f"Mensagem ID={msg_id} marcada como \\Deleted")
@@ -935,10 +950,10 @@ def root():
             "api_configured": bool(MAILGUN_API_KEY and MAILGUN_DOMAIN),
         },
         "llm": {
-            "backend": LLM_BACKEND,
-            "api_url_configured": bool(LLM_API_URL),
+            "api_url": LLM_API_URL,
             "model": LLM_MODEL,
             "hard_disable": LLM_HARD_DISABLE,
+            "has_api_key": bool(LLM_API_KEY),
         }
     })
 
