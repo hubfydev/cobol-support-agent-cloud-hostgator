@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# ****** COBOL Support Agent — v10.25 ********
+# ****** COBOL Support Agent — v10.26 ********
 # ****** Andre Richest                ********
-# ****** Tue Dec 02 2025              ********
+# ****** Wed Dec 03 2025              ********
 
 import os
 import ssl
@@ -190,8 +190,8 @@ def _call_llm(user_prompt: str) -> dict:
     payload = {
         "model": LLM_MODEL,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.2,
     }
@@ -404,6 +404,7 @@ def _append_to_sent_imap(imap, to_addr: str, subject: str, full_body: str):
     """
     Grava a cópia da resposta na pasta de itens enviados (IMAP_FOLDER_SENT),
     já como lida (\\Seen), para atender o requisito de aparecer em 'Sent Items'.
+    Faz também fallback automático para INBOX.<pasta> se o servidor exigir namespace.
     """
     if not IMAP_FOLDER_SENT:
         return
@@ -419,10 +420,42 @@ def _append_to_sent_imap(imap, to_addr: str, subject: str, full_body: str):
         msg_out.set_content(full_body)
 
         raw_out = msg_out.as_bytes()
-        imap.append(IMAP_FOLDER_SENT, "\\Seen", None, raw_out)
-        log.info(f"Resposta gravada em pasta de enviados: {IMAP_FOLDER_SENT}")
+
+        # Tentativa direta na pasta configurada
+        try:
+            typ, data = imap.append(IMAP_FOLDER_SENT, "\\Seen", None, raw_out)
+        except Exception as e:
+            log.warning(f"Falha ao gravar resposta em {IMAP_FOLDER_SENT}: {e}")
+            typ, data = "ERR", None
+
+        if typ == "OK":
+            log.info(f"Resposta gravada em pasta de enviados: {IMAP_FOLDER_SENT}")
+            return
+        else:
+            log.warning(
+                f"Falha ao gravar resposta em {IMAP_FOLDER_SENT}: typ={typ}, data={data}"
+            )
+
+        # Fallback com namespace INBOX., caso IMAP_FOLDER_SENT não seja totalmente qualificado
+        if not IMAP_FOLDER_SENT.upper().startswith("INBOX."):
+            fallback_folder = f"INBOX.{IMAP_FOLDER_SENT}"
+            try:
+                typ2, data2 = imap.append(fallback_folder, "\\Seen", None, raw_out)
+                if typ2 == "OK":
+                    log.info(
+                        f"Resposta gravada em pasta de enviados (fallback): {fallback_folder}"
+                    )
+                else:
+                    log.warning(
+                        f"Falha ao gravar resposta em {fallback_folder} (fallback): "
+                        f"typ={typ2}, data={data2}"
+                    )
+            except Exception as e2:
+                log.warning(
+                    f"Erro ao gravar resposta em {fallback_folder} (fallback): {e2}"
+                )
     except Exception as e:
-        log.warning(f"Falha ao gravar resposta em {IMAP_FOLDER_SENT}: {e}")
+        log.warning(f"Falha geral ao preparar resposta para {IMAP_FOLDER_SENT}: {e}")
 
 
 def _copy_with_namespace_fallback(imap, msg_id: bytes, folder: str, context: str):
