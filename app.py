@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# ****** COBOL Support Agent — v10.26 ********
+# ****** COBOL Support Agent — v10.27 ********
 # ****** Andre Richest                ********
 # ****** Wed Dec 03 2025              ********
 
@@ -108,7 +108,7 @@ OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", APP_TITLE)
 
 _llm_block_until_ts: float = 0.0
 
-# ==========================
+# ==========================  
 # Prompt do sistema
 # ==========================
 SYSTEM_PROMPT = (
@@ -124,42 +124,40 @@ SYSTEM_PROMPT = (
     "4) PT-BR no corpo. "
     "5) 'nivel_confianca' entre 0 e 1. "
     "6) Se pedido estiver claro e respondível, 'acao'='responder' com nivel_confianca>=0.8; "
-    "   se ambíguo/incompleto, 'acao'='escalar' com nivel_confianca<=0.6. "
+    "   se ambíguo/incompleto, ou se houver falha de leitura dos anexos, 'acao'='escalar' com nivel_confianca<=0.6. "
     "7) Assunto: defina 'assunto' EXATAMENTE como o assunto original do e-mail (não traduza, não resuma, não invente). "
     "   Se o original já tiver 'Re:' no início, mantenha como está. OBS: o sistema adicionará 'Re: ' no envio se faltar. "
-    "8) REGRA CRÍTICA DE ANEXOS (SEMPRE VALE): Mesmo que o e-mail venha sem texto, sem contexto ou sem perguntas, "
-    "   você DEVE ler todos os arquivos anexados, identificar a linguagem/propósito e fazer uma análise com recomendações objetivas. "
-    "   Considera-se 'pedido suficiente' a mera presença de anexos de código: nesse caso, responda com 'acao'='responder' "
-    "   e uma análise útil. "
-    "9) REGRA DE FALHA NA LEITURA DOS ANEXOS: Se você não conseguir acessar/visualizar o conteúdo real dos anexos (por exemplo, "
-    "   o conteúdo vier vazio, ilegível, truncado, com caracteres quebrados, ou você não conseguir citar nenhum trecho do código), "
-    "   NÃO responda de forma genérica. Em vez disso, informe que os anexos podem ter sido corrompidos no envio ou ficaram ilegíveis "
-    "   durante o processamento, e solicite que o aluno reenvie o conteúdo do(s) arquivo(s) colando o código diretamente no CORPO do e-mail "
-    "   (texto puro), além de reenviar os anexos se quiser. "
-    "   Nesse caso, defina 'acao'='escalar' com 'nivel_confianca'<=0.6 e liste exatamente o que o aluno deve colar (ex.: arquivo completo, "
-    "   mensagens de erro, entradas/saídas esperadas). "
-    "10) Se houver anexos de código e o conteúdo estiver legível, priorize analisar o conteúdo do anexo e a linguagem correta: "
-    "   10.1) Cite elementos como DIVISION, SECTION, PIC, níveis (01/05/77/88), "
-    "        WORKING-STORAGE, FILE SECTION, FD, SELECT/ASSIGN, ORGANIZATION, PERFORM, IF/EVALUATE, STRING/UNSTRING, "
-    "        tabelas OCCURS, REDEFINES, e quando aplicável SQLCA/EXEC SQL. Identifique erros comuns (tipagem, pontuação, "
-    "        colunas, incompatibilidade de PIC, falta de períodos, problemas em I/O) e sugira correções objetivas. "
-    "   10.2) JCL: arquivos .JCL/.JOB/.TXT contendo JCL. Cite JOB/EXEC/DD, PROC/INCLUDE, PARM, COND, DISP, DSN, SPACE, "
-    "        DCB, LRECL/RECFM/BLKSIZE, SYSIN, STEPLIB, e mensagens/abends quando fornecidas. Sugira melhorias de clareza, "
-    "        padronização, reuso via PROC, e correções de parâmetros. "
-    "   10.3) Visualg (Portugol): arquivos .ALG/.TXT contendo algoritmos. Analise sintaxe e lógica: inicio/fimalgoritmo, "
-    "        var, tipos (inteiro/real/logico/caractere), leia/escreva, se/senao, escolha/caso, para, enquanto, repita, "
-    "        vetores/matrizes, funções/procedimentos, operadores relacionais e lógicos. Aponte erros de digitação, variáveis "
-    "        não declaradas/inicializadas, conversões de tipo, laços infinitos e melhorias de legibilidade. "
-    "   10.4) Se a linguagem do código estiver incerta, deduza pelo conteúdo e responda focando na linguagem mais provável, "
-    "        deixando isso explícito no corpo (ex.: \"Pelo seu código, parece Visualg...\"). "
-    "11) Não mude o tema da conversa. Responda ao que foi solicitado, de forma educada, cordial, descontraída e objetiva, sempre como parte de um time (nós). "
-    "12) Se faltar informação para compilar/executar/testar, peça os dados mínimos: "
+    "8) REGRA CRÍTICA SOBRE ANEXOS: o sistema poderá informar explicitamente quantos anexos foram encontrados e poderá fornecer "
+    "   o nome, tipo e conteúdo extraído de cada anexo. Se o contexto indicar que EXISTEM anexos, você NUNCA deve afirmar que "
+    "   'não há anexos' ou que 'nenhum anexo foi encontrado'. "
+    "9) Se houver anexos com conteúdo textual legível no contexto, você DEVE analisar esse conteúdo e responder com 'acao'='responder', "
+    "   mesmo que o corpo do e-mail esteja vazio. A mera presença de código legível em anexo já é suficiente para uma resposta útil. "
+    "10) Se o contexto indicar que há anexos, mas o conteúdo extraído estiver ausente, vazio, truncado, ilegível, corrompido, "
+    "    ou insuficiente para citar qualquer trecho real do código, então trate isso como FALHA DE PROCESSAMENTO DE ANEXO, "
+    "    e NÃO como ausência de anexo. Nesse caso, informe que o arquivo pode ter sido corrompido no envio ou ficou ilegível "
+    "    durante o processamento, e peça ao aluno que reenvie o conteúdo colando o código diretamente no corpo do e-mail em texto puro. "
+    "    Nesse cenário, use 'acao'='escalar' com 'nivel_confianca'<=0.6. "
+    "11) Se houver anexos de código e o conteúdo estiver legível, priorize analisar o conteúdo do anexo e a linguagem correta: "
+    "   11.1) COBOL: arquivos .CBL/.COB/.TXT/.CPY contendo os fontes em COBOL. Cite elementos como DIVISION, SECTION, PIC, níveis (01/05/77/88), "
+    "         WORKING-STORAGE, FILE SECTION, FD, SELECT/ASSIGN, ORGANIZATION, PERFORM, IF/EVALUATE, STRING/UNSTRING, "
+    "         tabelas OCCURS, REDEFINES, e quando aplicável SQLCA/EXEC SQL. Identifique erros comuns e sugira correções objetivas. "
+    "   11.2) JCL: arquivos .JCL/.JOB/.TXT contendo o JCL. Cite JOB/EXEC/DD, PROC/INCLUDE, PARM, COND, DISP, DSN, SPACE, "
+    "         DCB, LRECL/RECFM/BLKSIZE, SYSIN, STEPLIB, e mensagens/abends quando fornecidas. "
+    "   11.3) Visualg (Portugol): arquivos .ALG/.TXT contendo algoritmos. Analise sintaxe e lógica: inicio/fimalgoritmo, "
+    "         var, tipos (inteiro/real/logico/caractere), leia/escreva, se/senao, escolha/caso, para, enquanto, repita, "
+    "         vetores/matrizes, funções/procedimentos, operadores relacionais e lógicos. "
+    "   11.4) Se a linguagem do código estiver incerta, deduza pelo conteúdo e responda focando na linguagem mais provável, "
+    "         deixando isso explícito no corpo. "
+    "12) NUNCA invente análise de código que não esteja visível no contexto. Se você não conseguir citar ou descrever "
+    "    nenhum trecho real, trate como falha de leitura do anexo. "
+    "13) Não mude o tema da conversa. Responda ao que foi solicitado, de forma educada, cordial, descontraída e objetiva, sempre como parte de um time (nós). "
+    "14) Se faltar informação para compilar/executar/testar, peça os dados mínimos: "
     "   - COBOL: compilador/ambiente (GnuCOBOL/Enterprise), SO, JCL (se batch), layouts/FD, amostras de entrada/saída, "
     "     mensagens de erro e comando de compilação. "
     "   - JCL: objetivo do job, PROC envolvidos, dataset names, mensagens/RC/abends, e trechos completos dos passos relevantes. "
     "   - Visualg: enunciado do exercício, entradas esperadas e saídas esperadas, e a versão do Visualg (se souber). "
     "   Observação: Mesmo quando pedir esses dados mínimos, ainda assim entregue a melhor análise possível do que estiver disponível no anexo. "
-    "13) No final do 'corpo_markdown', SEMPRE inclua um parágrafo curto de incentivo, parabenizando o aluno por estar estudando "
+    "15) No final do 'corpo_markdown', SEMPRE inclua um parágrafo curto de incentivo, parabenizando o aluno por estar estudando "
     "    e motivando a continuar. Em seguida, inclua exatamente estas duas linhas (URLs como texto puro, sem markdown de link): "
     "- Nossa Comunidade no Telegram: https://t.me/aprendacobol "
     "- Conheça a Formação Completa de Programador COBOL: https://assinatura.aprendacobol.com.br "
@@ -219,8 +217,8 @@ def _call_llm(user_prompt: str) -> dict:
     payload = {
         "model": LLM_MODEL,
         "messages": [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.2,
     }
@@ -236,7 +234,6 @@ def _call_llm(user_prompt: str) -> dict:
                 timeout=LLM_TIMEOUT,
             )
             if resp.status_code != 200:
-                # Log detalhado para debug (inclui início do corpo da resposta)
                 try:
                     snippet = resp.text[:500]
                 except Exception:
@@ -247,7 +244,6 @@ def _call_llm(user_prompt: str) -> dict:
                 resp.raise_for_status()
 
             data = resp.json()
-            # Tenta formato estilo chat.completions OpenAI/OpenRouter
             content = None
             try:
                 content = data["choices"][0]["message"]["content"]
@@ -280,13 +276,11 @@ def _extract_email_plaintext(msg) -> str:
             return payload.decode("utf-8", errors="replace")
 
     if msg.is_multipart():
-        # Primeiro tenta text/plain sem ser attachment
         for part in msg.walk():
             ctype = part.get_content_type()
             disp = (part.get("Content-Disposition") or "").lower()
             if ctype == "text/plain" and "attachment" not in disp:
                 return decode_payload(part)
-        # Depois tenta text/html
         for part in msg.walk():
             ctype = part.get_content_type()
             disp = (part.get("Content-Disposition") or "").lower()
@@ -297,27 +291,107 @@ def _extract_email_plaintext(msg) -> str:
         return decode_payload(msg)
 
 
-def _extract_cobol_attachments(msg) -> str:
+def _decode_bytes_safely(payload: bytes, preferred_charset: Optional[str] = None) -> str:
     """
-    Retorna string com conteúdo (truncado) de anexos COBOL (.cob, .cbl, .cpy).
+    Decodifica bytes de forma robusta para anexos de texto/código.
     """
-    texts = []
+    candidates = []
+    if preferred_charset:
+        candidates.append(preferred_charset)
+    candidates.extend(["utf-8", "latin-1", "cp1252"])
+
+    tried = set()
+    for enc in candidates:
+        if not enc or enc in tried:
+            continue
+        tried.add(enc)
+        try:
+            return payload.decode(enc)
+        except Exception:
+            pass
+
+    return payload.decode("utf-8", errors="replace")
+
+
+def _extract_code_attachments(msg) -> Tuple[int, int, str]:
+    """
+    Extrai anexos relevantes de código/texto e devolve:
+    (total_anexos_relevantes, anexos_legiveis, texto_formatado_para_llm)
+
+    Suporta:
+    - COBOL: .cob .cbl .cpy
+    - JCL: .jcl .job
+    - Visualg: .alg
+    - Texto genérico: .txt
+    """
+    supported_exts = (".cob", ".cbl", ".cpy", ".jcl", ".job", ".txt", ".alg")
+
+    total_found = 0
+    total_readable = 0
+    chunks = []
+    total_chars_budget = 30000
+    per_file_budget = 12000
+
     for part in msg.walk():
-        disp = (part.get("Content-Disposition") or "").lower()
+        if part.is_multipart():
+            continue
+
         fname = part.get_filename()
-        if "attachment" in disp and fname:
+        disp = (part.get("Content-Disposition") or "").lower()
+        ctype = (part.get_content_type() or "").lower()
+
+        is_candidate = False
+        if fname:
             lf = fname.lower()
-            if lf.endswith((".cob", ".cbl", ".cpy")):
-                payload = part.get_payload(decode=True) or b""
-                charset = part.get_content_charset() or "utf-8"
-                try:
-                    content = payload.decode(charset, errors="replace")
-                except Exception:
-                    content = payload.decode("utf-8", errors="replace")
-                if len(content) > 8000:
-                    content = content[:8000]
-                texts.append(f"Arquivo: {fname}\n{content}")
-    return "\n\n".join(texts)
+            if lf.endswith(supported_exts):
+                is_candidate = True
+        elif "attachment" in disp and ctype.startswith("text/"):
+            is_candidate = True
+
+        if not is_candidate:
+            continue
+
+        total_found += 1
+        payload = part.get_payload(decode=True) or b""
+        preferred_charset = part.get_content_charset()
+
+        content = _decode_bytes_safely(payload, preferred_charset).strip()
+
+        safe_name = fname or "(sem nome)"
+        safe_type = ctype or "application/octet-stream"
+        size_bytes = len(payload)
+
+        if content:
+            total_readable += 1
+            if len(content) > per_file_budget:
+                content = content[:per_file_budget] + "\n[... conteúdo truncado ...]"
+
+            chunk = (
+                f"[ANEXO {total_found}]\n"
+                f"nome_arquivo: {safe_name}\n"
+                f"tipo_mime: {safe_type}\n"
+                f"tamanho_bytes: {size_bytes}\n"
+                f"conteudo_extraido:\n{content}\n"
+            )
+        else:
+            chunk = (
+                f"[ANEXO {total_found}]\n"
+                f"nome_arquivo: {safe_name}\n"
+                f"tipo_mime: {safe_type}\n"
+                f"tamanho_bytes: {size_bytes}\n"
+                f"conteudo_extraido: [VAZIO OU ILEGÍVEL]\n"
+            )
+
+        current_size = sum(len(c) for c in chunks)
+        if current_size + len(chunk) > total_chars_budget:
+            remaining = max(0, total_chars_budget - current_size)
+            if remaining > 200:
+                chunks.append(chunk[:remaining] + "\n[... limite total de anexos atingido ...]\n")
+            break
+
+        chunks.append(chunk)
+
+    return total_found, total_readable, "\n".join(chunks)
 
 
 def _default_reply_dict(subject: str) -> dict:
@@ -356,26 +430,32 @@ def _generate_reply_for_message(msg) -> Optional[dict]:
         else:
             return None
 
-    # Se LLM não está configurada, trata como 'hard disable'
     if (not LLM_API_URL or not LLM_MODEL or not LLM_API_KEY) or LLM_HARD_DISABLE:
         log.info("LLM desativada ou não configurada; usando resposta padrão.")
         return _default_reply_dict(subject)
 
     from_addr = parseaddr(msg.get("From", ""))[1]
     body_txt = _extract_email_plaintext(msg)
-    cobol_txt = _extract_cobol_attachments(msg)
+    total_attachments, readable_attachments, attachments_txt = _extract_code_attachments(msg)
 
     user_prompt = (
         f"Remetente: {from_addr}\n"
         f"Assunto original: {subject}\n\n"
-        f"Corpo do e-mail (texto):\n{body_txt}\n\n"
+        f"Corpo do e-mail (texto):\n{body_txt or '[vazio]'}\n\n"
+        f"ANEXOS ENCONTRADOS: {total_attachments}\n"
+        f"ANEXOS LEGÍVEIS: {readable_attachments}\n\n"
     )
-    if cobol_txt:
-        user_prompt += f"Anexos COBOL:\n{cobol_txt}\n\n"
+
+    if attachments_txt:
+        user_prompt += f"DETALHES DOS ANEXOS:\n{attachments_txt}\n\n"
+    elif total_attachments > 0:
+        user_prompt += (
+            "DETALHES DOS ANEXOS:\n"
+            "[Há anexos, mas nenhum conteúdo textual legível pôde ser extraído.]\n\n"
+        )
 
     try:
         reply = _call_llm(user_prompt)
-        # Garantir chaves básicas
         for k in ("assunto", "corpo_markdown", "nivel_confianca", "acao"):
             reply.setdefault(k, "")
         return reply
@@ -450,7 +530,6 @@ def _append_to_sent_imap(imap, to_addr: str, subject: str, full_body: str):
 
         raw_out = msg_out.as_bytes()
 
-        # Tentativa direta na pasta configurada
         try:
             typ, data = imap.append(IMAP_FOLDER_SENT, "\\Seen", None, raw_out)
         except Exception as e:
@@ -465,7 +544,6 @@ def _append_to_sent_imap(imap, to_addr: str, subject: str, full_body: str):
                 f"Falha ao gravar resposta em {IMAP_FOLDER_SENT}: typ={typ}, data={data}"
             )
 
-        # Fallback com namespace INBOX., caso IMAP_FOLDER_SENT não seja totalmente qualificado
         if not IMAP_FOLDER_SENT.upper().startswith("INBOX."):
             fallback_folder = f"INBOX.{IMAP_FOLDER_SENT}"
             try:
@@ -495,7 +573,6 @@ def _copy_with_namespace_fallback(imap, msg_id: bytes, folder: str, context: str
     if not folder:
         return
 
-    # Tentativa direta
     try:
         typ, data = imap.copy(msg_id, folder)
         if typ == "OK":
@@ -511,7 +588,6 @@ def _copy_with_namespace_fallback(imap, msg_id: bytes, folder: str, context: str
             f"Erro ao copiar mensagem ID={msg_id} para {folder} ({context}): {e}"
         )
 
-    # Fallback com namespace INBOX.
     fallback_folder = f"INBOX.{folder}"
     try:
         typ, data = imap.copy(msg_id, fallback_folder)
@@ -702,7 +778,6 @@ def send_test_email(to_addr: str, subject: str, body: str) -> str:
     if MAILGUN_API_KEY and MAILGUN_DOMAIN:
         return send_via_mailgun_api(to_addr, subject, body)
 
-    # fallback SMTP (provavelmente não vai funcionar na Render, mas fica para compatibilidade)
     s = smtp_connect_with_fallback()
     try:
         msg = EmailMessage()
@@ -735,13 +810,11 @@ def _search_messages(imap) -> List[bytes]:
     """
     criteria: List[str] = []
 
-    # Base: UNSEEN ou ALL
     if IMAP_STRICT_UNSEEN_ONLY:
         criteria.append("UNSEEN")
     else:
         criteria.append("ALL")
 
-    # SINCE (opcional)
     if IMAP_SINCE_DAYS > 0:
         since_date = (datetime.utcnow() - timedelta(IMAP_SINCE_DAYS)).strftime("%d-%b-%Y")
         criteria.extend(["SINCE", since_date])
@@ -770,23 +843,19 @@ def _should_skip_message(msg) -> bool:
         IMAP_USER.lower(),
     ])
 
-    # Não responder e-mails que nós mesmos enviamos
     if from_addr in support_addrs:
         log.info(f"Pulando mensagem de {from_addr} (provavelmente nós mesmos)")
         return True
 
-    # Evitar auto-resposta para notificações típicas
     subj = (msg.get("Subject", "") or "").lower()
     if "mailer-daemon" in from_addr or "postmaster@" in from_addr:
         log.info(f"Pulando bounce/mail daemon: {from_addr}")
         return True
 
-    # Filtrar rápido notificações Hotmart/noreply aqui também (além do prompt)
     if "hotmart" in from_addr or "noreply" in from_addr:
         log.info(f"Pulando notificação automatizada: {from_addr}")
         return True
 
-    # Exemplo de filtro simples por assunto (ajuste se quiser)
     if subj.startswith("re:") and from_addr == to_addr:
         log.info(f"Pulando potencial loop de resposta para {from_addr}")
         return True
@@ -826,8 +895,6 @@ def _process_single_message(imap, msg_id: bytes):
 
         reply = _generate_reply_for_message(msg)
 
-        # Se reply=None, significa que LLM está bloqueada e fallback desabilitado:
-        # não responde, apenas manda para Escalar.
         if reply is None:
             log.info("Nenhuma resposta automática gerada. Encaminhando e-mail para Escalar.")
             try:
@@ -846,7 +913,6 @@ def _process_single_message(imap, msg_id: bytes):
                     log.warning(f"Falha ao marcar \\Deleted para ID={msg_id}: {e}")
             return
 
-        # Normaliza resposta da LLM / fallback
         llm_subject = reply.get("assunto") or subject or "(sem assunto)"
         corpo_markdown = reply.get("corpo_markdown") or ""
         acao = (reply.get("acao") or "responder").lower().strip()
@@ -856,13 +922,10 @@ def _process_single_message(imap, msg_id: bytes):
         if not reply_subject.lower().startswith("re:"):
             reply_subject = f"Re: {reply_subject}"
 
-        # Decide se escalável
         escalate = (acao == "escalar")
 
         full_body = _compose_full_text(corpo_markdown)
 
-        # Envia resposta para o remetente original (SEMPRE que houver corpo e remetente),
-        # independentemente de 'acao' ser 'responder' ou 'escalar'
         if from_addr and corpo_markdown.strip():
             send_test_email(
                 to_addr=from_addr,
@@ -873,7 +936,6 @@ def _process_single_message(imap, msg_id: bytes):
                 f"Resposta enviada para {from_addr} (acao={acao}, nivel_confianca={nivel_confianca})"
             )
 
-            # Grava cópia na pasta de enviados (Sent Items)
             _append_to_sent_imap(imap, from_addr, reply_subject, full_body)
         elif not from_addr:
             log.warning(f"Mensagem ID={msg_id} sem remetente válido; não foi possível responder")
@@ -882,19 +944,15 @@ def _process_single_message(imap, msg_id: bytes):
                 f"Mensagem ID={msg_id} com resposta vazia; nada enviado, mas fluxo de pastas continuará (acao={acao})."
             )
 
-        # MOVIMENTAÇÃO EM PASTAS
         if escalate:
-            # 1) Copiar APENAS para FOLDER_ESCALATE, mantendo como 'não lido' lá.
             if FOLDER_ESCALATE:
                 _copy_with_namespace_fallback(imap, msg_id, FOLDER_ESCALATE, "escalar")
 
-            # 2) Agora marcar original como lida (para não reprocessar)
             try:
                 imap.store(msg_id, "+FLAGS", "\\Seen")
             except Exception as e:
                 log.warning(f"Falha ao marcar \\Seen para ID={msg_id}: {e}")
 
-            # 3) Opcionalmente marcar para remoção da INBOX
             if EXPUNGE_AFTER_COPY:
                 try:
                     imap.store(msg_id, "+FLAGS", "\\Deleted")
@@ -902,7 +960,6 @@ def _process_single_message(imap, msg_id: bytes):
                 except Exception as e:
                     log.warning(f"Falha ao marcar \\Deleted para ID={msg_id}: {e}")
         else:
-            # Fluxo normal: marcar como lida, copiar para Respondidos e opcionalmente remover da INBOX
             try:
                 imap.store(msg_id, "+FLAGS", "\\Seen")
             except Exception as e:
@@ -947,7 +1004,6 @@ def process_inbox_once():
                 for msg_id in ids:
                     _process_single_message(imap, msg_id)
 
-            # Se deletamos algo, dá um expunge
             if EXPUNGE_AFTER_COPY:
                 try:
                     imap.expunge()
@@ -1062,7 +1118,6 @@ def diag_imap_auth():
 
 @app.get("/diag/smtp/auth")
 def diag_smtp_auth():
-    # Mantido para debug, mas provavelmente vai continuar dando timeout na Render.
     host = request.args.get("host")
     port = request.args.get("port")
     mode = (request.args.get("mode") or SMTP_TLS_MODE).lower()
