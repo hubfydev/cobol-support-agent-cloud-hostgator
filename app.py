@@ -139,7 +139,7 @@ SYSTEM_PROMPT = (
     "   Nesse caso, defina 'acao'='escalar' com 'nivel_confianca'<=0.6 e liste exatamente o que o aluno deve colar (ex.: arquivo completo, "
     "   mensagens de erro, entradas/saídas esperadas). "
     "10) Se houver anexos de código e o conteúdo estiver legível, priorize analisar o conteúdo do anexo e a linguagem correta: "
-    "   10.1) COBOL: arquivos .COB/.CBL/.CPY/.TXT. Cite elementos como DIVISION, SECTION, PIC, níveis (01/05/77/88), "
+    "   10.1) Cite elementos como DIVISION, SECTION, PIC, níveis (01/05/77/88), "
     "        WORKING-STORAGE, FILE SECTION, FD, SELECT/ASSIGN, ORGANIZATION, PERFORM, IF/EVALUATE, STRING/UNSTRING, "
     "        tabelas OCCURS, REDEFINES, e quando aplicável SQLCA/EXEC SQL. Identifique erros comuns (tipagem, pontuação, "
     "        colunas, incompatibilidade de PIC, falta de períodos, problemas em I/O) e sugira correções objetivas. "
